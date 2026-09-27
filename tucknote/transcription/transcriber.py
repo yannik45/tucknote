@@ -70,7 +70,7 @@ class WhisperTranscriber:
         model_size_or_path: str = "small",
         device: str = "cpu",
         compute_type: str = "int8",
-        language: str | None = "de",
+        language: str | None = None,
     ):
         self.model_size_or_path = model_size_or_path
         self.device = device
