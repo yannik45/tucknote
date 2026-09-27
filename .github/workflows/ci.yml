@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build & Test (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run Backend & Core Tests
+        run: |
+          uv run pytest tests/test_storage.py tests/test_context.py tests/test_recorder.py tests/test_transcriber.py tests/test_hotkey.py -v
+
+      - name: Run Frontend & UI Tests
+        run: |
+          uv run pytest tests/test_ui.py -v
+
+      - name: Run End-to-End Integration Tests
+        run: |
+          uv run pytest tests/test_integration.py -v
+
+      - name: Verify CLI Package Build
+        run: |
+          uv run tucknote --help
