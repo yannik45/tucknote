@@ -11,19 +11,42 @@ Capture a thought. Keep its context.
    - Press once to start voice recording.
    - The app **immediately captures the active window context** (application name, process ID, and window title like `Visual Studio Code` or `msedge.exe`) before any focus changes occur.
    - Press again to stop recording.
-2. **Local Transcription:**
-   - Audio is transcribed locally on CPU (`int8`) using `faster-whisper`.
-   - 100% offline — no cloud APIs, no external telemetry, and no network required after initial setup.
-   - Multilingual support (out-of-the-box support for English, German, and others).
-3. **SQLite Persistence:**
-   - Transcripts are stored atomically in a local SQLite database along with UTC timestamp, app name, and window title.
-   - Once saved, temporary audio files are immediately deleted.
-4. **Searchable Library:**
-   - Accessible via the system tray or launch with `--show-library`.
-   - Chronological list (newest notes first).
-   - Real-time search across transcript text, application name, and window title.
-   - Edit notes (the original transcript is always preserved for reference) or delete them.
-   - One-click copy to clipboard.
+2. **Local Transcription & Speech Optimization:**
+   - Audio is transcribed locally on CPU (`int8`) using `faster-whisper` (default model `small`).
+   - Dynamic prompt priming injects tech vocabulary (`Antigravity`, `Recording`, `Clipboard`, `VS Code`, `GitHub`, `API`, `Git`, etc.) and active window context to eliminate misspellings.
+   - Headroom peak audio normalization prevents phoneme hallucinations on quiet speech starts.
+   - Language selection (`Deutsch (Empfohlen für Denglisch)`, `English`, `Auto-detect`) configurable directly in Settings.
+3. **Local AI Post-Processing & Smart Categorization (100% Offline):**
+   - Embedded local LLM engine powered by a portable `llama.cpp` runtime and Qwen 2.5 (`0.5B` or `1.5B`).
+   - Corrects grammar, punctuation, and misheard technical words using active window context.
+   - Automatically categorizes thoughts (`🔨 Task`, `🐛 Bug`, `💡 Idea`, `📝 Note`) and generates relevant `#tags`.
+   - Fast deterministic rule-based fallback mode available for instant processing without LLMs.
+4. **Floating Recording Overlay:**
+   - Compact, semi-transparent pill widget floating unobtrusively above active windows.
+   - Click to start/stop or cancel recordings, toggle screenshots, copy text, or access the Library.
+   - Draggable across the desktop with automatic position saving between sessions.
+   - Toggle visibility anytime via the system tray menu.
+   - **Context-Safe:** Tucknote continuously monitors the active external application. Interacting with the overlay will *never* misattribute the note's context to Tucknote itself.
+5. **Conscious Screenshot Capture:**
+   - Optional one-click screenshot capture via the overlay before or during recording.
+   - Automatically minimizes the overlay during capture to keep your notes clean.
+   - Thumbnails are previewed immediately with an option to remove before saving.
+   - Stored locally in `%LOCALAPPDATA%\tucknote\screenshots\` and automatically purged whenever a note is deleted.
+6. **Dual Text Versions (Original & Refined):**
+   - Transcripts preserve the raw audio verbatim (`transcript_original` is never altered).
+   - Seamlessly switch between Original and Refined tabs in the Library view.
+   - Both versions can be copied separately.
+7. **Clipboard Integration:**
+   - One-click copy buttons in both the floating overlay and the Library detail inspector.
+   - Optional setting to automatically copy the final text to your clipboard upon successful transcription.
+8. **SQLite Persistence & Migration (Schema v3):**
+   - Auto-migrating SQLite storage with automatic migration from v1 and v2 to Schema v3.
+   - Stores notes with UTC timestamps, application context, processed text, category, tags, and screenshot references.
+   - Temporary audio files are safely cleaned up once transcribed.
+9. **Searchable Library & Settings:**
+   - Accessible via the tray menu (`Settings...`), floating overlay, or `--show-library`.
+   - Chronological list with real-time search across original text, refined text, category, tags, app names, and window titles.
+   - Configure Whisper Model (`small`, `base`, `medium`, `large-v3-turbo`), Language, Text Refinement Engine (`Local AI` or `Rule-based`), and LLM Model (`Qwen 0.5B` or `1.5B`) directly in the collapsible Settings panel.
 
 ---
 
@@ -107,6 +130,10 @@ The tray context menu (right-click) also allows manual start/stop if the hotkey 
 
 - **SQLite Database:**  
   `%LOCALAPPDATA%\tucknote\notes.db`
+- **Application Settings:**  
+  `%LOCALAPPDATA%\tucknote\settings.json`
+- **Screenshots:**  
+  `%LOCALAPPDATA%\tucknote\screenshots\` (tied to notes; deleted automatically when a note is deleted).
 - **Temporary Audio Recordings:**  
   `%LOCALAPPDATA%\tucknote\temp_audio\` (deleted automatically upon successful transcription; kept temporarily only if an inference error occurs to allow retrying).
 - **Log Files:**  

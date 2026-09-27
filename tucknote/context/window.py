@@ -1,4 +1,4 @@
-"""Windows foreground window and process context capture."""
+"""Windows foreground window and process context capture with external window tracking."""
 
 from __future__ import annotations
 
@@ -20,10 +20,17 @@ DESKTOP_ACCESS = 0x01FF
 
 
 class WindowContextGrabber:
-    """Captures the active foreground window title and application name via Win32 APIs."""
+    """Captures the active foreground window title and application name via Win32 APIs.
+    
+    Includes tracking to ensure clicking the Tucknote overlay does not accidentally
+    record Tucknote itself as the active application.
+    """
 
     def __init__(self):
         self._is_windows = sys.platform == "win32"
+        self._our_pid = os.getpid()
+        self._last_external_context: WindowContext | None = None
+
         if self._is_windows:
             import ctypes
             from ctypes import wintypes
@@ -33,11 +40,37 @@ class WindowContextGrabber:
             self._user32 = ctypes.windll.user32
             self._kernel32 = ctypes.windll.kernel32
 
-    def capture_active_window(self) -> WindowContext:
+    @property
+    def last_external_context(self) -> WindowContext | None:
+        return self._last_external_context
+
+    def is_own_window(self, pid: int | None, window_title: str | None, app_name: str | None) -> bool:
+        """Determine if a window belongs to the Thought Capture / tucknote process."""
+        if pid is not None and pid == self._our_pid:
+            return True
+        if window_title and ("Thought Capture" in window_title or "tucknote" in window_title.lower()):
+            if app_name and app_name.lower() in ("python.exe", "pythonw.exe", "tucknote.exe"):
+                return True
+        return False
+
+    def poll_external_window(self) -> WindowContext | None:
+        """Background poll called periodically to keep track of the last external application."""
+        if not self._is_windows:
+            return None
+        try:
+            ctx = self._capture_win32(datetime.now(timezone.utc).isoformat())
+            if ctx.process_id and not self.is_own_window(ctx.process_id, ctx.window_title, ctx.application):
+                self._last_external_context = ctx
+                return ctx
+        except Exception:
+            pass
+        return self._last_external_context
+
+    def capture_active_window(self, allow_self: bool = False) -> WindowContext:
         """Capture the foreground window context immediately before any app focus change.
         
-        Returns WindowContext with whatever fields could be safely retrieved;
-        missing/inaccessible fields remain None.
+        If allow_self is False and the currently focused window is Tucknote (e.g. user
+        just clicked the overlay), it returns the last active external window instead.
         """
         now_utc = datetime.now(timezone.utc).isoformat()
 
@@ -46,9 +79,40 @@ class WindowContextGrabber:
             return WindowContext(captured_at_utc=now_utc)
 
         try:
-            return self._capture_win32(now_utc)
+            ctx = self._capture_win32(now_utc)
+
+            # Check if this is our own window (e.g. user clicked overlay button)
+            if not allow_self and self.is_own_window(ctx.process_id, ctx.window_title, ctx.application):
+                if self._last_external_context:
+                    logger.debug(
+                        "Active window is Tucknote (%s); falling back to last external context: %s (%s)",
+                        ctx.window_title,
+                        self._last_external_context.application,
+                        self._last_external_context.window_title,
+                    )
+                    # Return a copy with fresh timestamp
+                    return WindowContext(
+                        application=self._last_external_context.application,
+                        window_title=self._last_external_context.window_title,
+                        process_id=self._last_external_context.process_id,
+                        process_path=self._last_external_context.process_path,
+                        captured_at_utc=now_utc,
+                    )
+
+            if not self.is_own_window(ctx.process_id, ctx.window_title, ctx.application) and (ctx.process_id or ctx.window_title):
+                self._last_external_context = ctx
+
+            return ctx
         except Exception as exc:
             logger.warning("Error capturing active window context: %s", exc)
+            if self._last_external_context and not allow_self:
+                return WindowContext(
+                    application=self._last_external_context.application,
+                    window_title=self._last_external_context.window_title,
+                    process_id=self._last_external_context.process_id,
+                    process_path=self._last_external_context.process_path,
+                    captured_at_utc=now_utc,
+                )
             return WindowContext(captured_at_utc=now_utc)
 
     def _capture_win32(self, now_utc: str) -> WindowContext:
@@ -120,18 +184,10 @@ class WindowContextGrabber:
 
         # Friendly fallback if process name is unknown but window title exists
         if not app_name and window_title:
-            # Check if there is a known suffix like " - Visual Studio Code"
             if " - " in window_title:
                 parts = window_title.rsplit(" - ", 1)
                 if len(parts) == 2 and len(parts[1]) < 40:
                     app_name = parts[1]
-
-        logger.debug(
-            "Captured window context: app='%s', title='%s', pid=%s",
-            app_name,
-            window_title[:30] if window_title else None,
-            pid_val,
-        )
 
         return WindowContext(
             application=app_name,

@@ -14,6 +14,8 @@ logger = logging.getLogger("tucknote")
 
 class TraySignals(QObject):
     open_library_requested = Signal()
+    open_settings_requested = Signal()
+    toggle_overlay_requested = Signal()
     toggle_recording_requested = Signal()
     cancel_recording_requested = Signal()
     retry_last_requested = Signal()
@@ -29,6 +31,7 @@ class ThoughtCaptureTray(QSystemTrayIcon):
         self.hotkey_str = hotkey_str
         self.signals = TraySignals()
         self.current_state = "ready"
+        self._overlay_visible = True
 
         self._build_menu()
         self.setToolTip(f"Thought Capture — Ready ({self.hotkey_str})")
@@ -44,10 +47,20 @@ class ThoughtCaptureTray(QSystemTrayIcon):
 
         self.menu.addSeparator()
 
+        # Overlay Toggle
+        self.overlay_action = QAction("Hide Overlay", self.menu)
+        self.overlay_action.triggered.connect(self.signals.toggle_overlay_requested.emit)
+        self.menu.addAction(self.overlay_action)
+
         # Library
         self.open_lib_action = QAction("Open Library...", self.menu)
         self.open_lib_action.triggered.connect(self.signals.open_library_requested.emit)
         self.menu.addAction(self.open_lib_action)
+
+        # Settings
+        self.open_settings_action = QAction("⚙️ Settings...", self.menu)
+        self.open_settings_action.triggered.connect(self.signals.open_settings_requested.emit)
+        self.menu.addAction(self.open_settings_action)
 
         self.menu.addSeparator()
 
@@ -81,6 +94,10 @@ class ThoughtCaptureTray(QSystemTrayIcon):
         self.menu.addAction(self.quit_action)
 
         self.setContextMenu(self.menu)
+
+    def set_overlay_visible(self, visible: bool) -> None:
+        self._overlay_visible = visible
+        self.overlay_action.setText("Hide Overlay" if visible else "Show Overlay")
 
     def update_state(self, state: str, detail_message: str | None = None) -> None:
         """Update the visual state of the tray icon and context menu."""

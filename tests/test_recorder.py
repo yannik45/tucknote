@@ -57,3 +57,18 @@ def test_recorder_stop_empty(tmp_path: Path):
     assert saved_path is None
     assert duration == 0.0
     assert not target.exists()
+
+
+def test_normalize_audio_frames():
+    from tucknote.audio.recorder import normalize_audio_frames
+    # Quiet signal with peak 2000
+    quiet_signal = np.array([0, 1000, 2000, -1500, 500], dtype=np.int16)
+    normalized = normalize_audio_frames(quiet_signal, target_headroom=0.95, max_gain=8.0)
+    # Peak should now be amplified
+    assert np.max(np.abs(normalized)) > 2000
+
+    # Silent signal (below threshold) should not be amplified
+    silent = np.array([0, 10, -10, 5], dtype=np.int16)
+    norm_silent = normalize_audio_frames(silent)
+    assert np.array_equal(silent, norm_silent)
+

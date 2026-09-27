@@ -32,9 +32,9 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
-      - name: Run Backend & Core Tests
+      - name: Run Backend, Storage & Processor Tests
         run: |
-          uv run pytest tests/test_storage.py tests/test_context.py tests/test_recorder.py tests/test_transcriber.py tests/test_hotkey.py -v
+          uv run pytest tests/test_storage.py tests/test_context.py tests/test_recorder.py tests/test_transcriber.py tests/test_hotkey.py tests/test_processor.py tests/test_settings.py -v
 
       - name: Run Frontend & UI Tests
         run: |
