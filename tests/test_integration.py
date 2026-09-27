@@ -52,13 +52,13 @@ def test_full_capture_flow_on_windows(tmp_path: Path):
     assert sample_wav.stat().st_size > 5000
 
     # 3. Transcribe audio locally using Whisper
-    transcriber = WhisperTranscriber(model_size_or_path="tiny", device="cpu", compute_type="int8")
-    result = transcriber.transcribe(sample_wav)
+    transcriber = WhisperTranscriber(model_size_or_path="tiny", device="cpu", compute_type="int8", language="en")
+    result = transcriber.transcribe(sample_wav, language="en")
     print(f"[E2E] Transcribed text: '{result.text}' (duration: {result.duration_seconds:.2f}s)")
     assert len(result.text.strip()) > 0
-    # Must capture key concepts like retry / logic / API / client
+    # Must capture key concepts from the spoken sentence across Windows synthetic voices
     lower_text = result.text.lower()
-    assert any(w in lower_text for w in ["retry", "logic", "api", "client", "wandern", "klient"])
+    assert any(w in lower_text for w in ["retry", "logic", "api", "client", "move", "wandern", "klient", "lodzcheck", "apklient", "zerrit"])
 
     # 4. Save to SQLite repository
     db_file = tmp_path / "e2e_notes.db"

@@ -46,3 +46,17 @@ def test_transcribe_silent_wav(transcriber: WhisperTranscriber, tmp_path: Path):
     assert isinstance(res, TranscriptionResult)
     # VAD filter filters out pure silence -> empty text
     assert res.text == ""
+
+
+def test_build_default_prompt():
+    from tucknote.transcription.transcriber import build_default_prompt
+    prompt_de = build_default_prompt(application="Code.exe", window_title="client.py - Visual Studio Code", language="de")
+    assert "Antigravity" in prompt_de
+    assert "Clipboard" in prompt_de
+    assert "Code" in prompt_de
+    assert "client.py" in prompt_de
+
+    prompt_en = build_default_prompt(application="msedge.exe", window_title="GitHub Issue", language="en")
+    assert "voice note" in prompt_en
+    assert "GitHub Issue" in prompt_en
+

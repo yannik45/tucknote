@@ -24,6 +24,35 @@ class NoMicrophoneError(AudioError):
     pass
 
 
+def normalize_audio_frames(
+    raw_data: np.ndarray,
+    target_headroom: float = 0.95,
+    max_gain: float = 8.0,
+    min_peak_threshold: int = 150,
+) -> np.ndarray:
+    """Peak-normalizes 16-bit PCM audio frames to optimal volume level for Whisper.
+    
+    Prevents Whisper phonetic hallucinations on quiet sentence starts while
+    avoiding amplifying pure background noise floor.
+    """
+    if len(raw_data) == 0:
+        return raw_data
+
+    peak = int(np.max(np.abs(raw_data)))
+    if peak < min_peak_threshold:
+        return raw_data
+
+    target_peak = 32767.0 * target_headroom
+    gain = min(target_peak / peak, max_gain)
+
+    if gain <= 1.05:
+        return raw_data
+
+    logger.debug("Normalizing audio: peak %d -> target %.0f (gain: %.2fx)", peak, target_peak, gain)
+    normalized = np.clip(raw_data.astype(np.float32) * gain, -32768, 32767).astype(np.int16)
+    return normalized
+
+
 class AudioRecorder:
     """Manages recording from default input audio device to WAV."""
 
@@ -158,6 +187,7 @@ class AudioRecorder:
             return None, 0.0
 
         raw_data = np.concatenate(frames_copy, axis=0)
+        raw_data = normalize_audio_frames(raw_data)
         num_samples = len(raw_data)
         duration_seconds = num_samples / self.sample_rate
 

@@ -10,15 +10,17 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Slot, QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
-from tucknote.config import AppConfig, get_db_path, get_temp_audio_dir
+from tucknote.config import AppConfig, AppSettings, get_db_path, get_temp_audio_dir
 from tucknote.context.window import WindowContextGrabber
 from tucknote.audio.recorder import AudioRecorder, AudioError, NoMicrophoneError
-from tucknote.transcription.transcriber import WhisperTranscriber, TranscriptionError
+from tucknote.transcription.transcriber import WhisperTranscriber, TranscriptionError, build_default_prompt
+from tucknote.transcription.processor import get_default_text_processor, RuleBasedTextProcessor
 from tucknote.storage.models import Note, WindowContext
 from tucknote.storage.repository import NoteRepository
 from tucknote.hotkey.listener import GlobalHotkeyListener, HotkeyRegistrationError
 from tucknote.ui.tray import ThoughtCaptureTray
 from tucknote.ui.library_window import LibraryWindow
+from tucknote.ui.overlay import RecordingOverlay
 
 logger = logging.getLogger("tucknote")
 
@@ -32,12 +34,14 @@ class StateCoordinator(QObject):
     recording_stopped = Signal(object, object)  # (Path, WindowContext)
     transcription_finished = Signal(object)      # Note
     transcription_failed = Signal(str, object, object)  # (error_str, wav_path, WindowContext)
+    note_refined = Signal(object)                # Note (asynchronously refined by LLM)
     no_speech_detected = Signal()
     error_occurred = Signal(str)
 
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
         self.config = config
+        self.settings = config.settings
         self.state = "ready"  # ready, recording, processing, error
 
         # Storage
@@ -46,6 +50,12 @@ class StateCoordinator(QObject):
 
         # Context Grabber
         self.context_grabber = WindowContextGrabber()
+
+        # Text processor
+        self.text_processor = get_default_text_processor(
+            engine=self.settings.refinement_engine,
+            model_key=self.settings.llm_model,
+        )
 
         # Audio Recorder
         self.recorder = AudioRecorder(
@@ -57,19 +67,21 @@ class StateCoordinator(QObject):
 
         # Transcriber
         self.transcriber = WhisperTranscriber(
-            model_size_or_path=config.whisper_model,
+            model_size_or_path=self.settings.whisper_model or config.whisper_model,
             device=config.whisper_device,
             compute_type=config.whisper_compute_type,
-            language=config.whisper_language,
+            language=self.settings.whisper_language or config.whisper_language,
         )
 
         # UI Components
         self.tray = ThoughtCaptureTray(hotkey_str=config.hotkey_str)
-        self.library_window = LibraryWindow(self.repository)
+        self.library_window = LibraryWindow(self.repository, settings=self.settings)
+        self.overlay = RecordingOverlay(self.settings)
 
         # State tracking
         self._current_context: WindowContext | None = None
         self._current_wav_path: Path | None = None
+        self._attached_screenshot: Path | None = None
         self._last_failed_wav: Path | None = None
         self._last_failed_context: WindowContext | None = None
 
@@ -84,6 +96,11 @@ class StateCoordinator(QObject):
             hotkey_str=config.hotkey_str,
             on_triggered=self._on_hotkey_thread_callback,
         )
+
+        # Periodic background poll to keep external foreground context fresh
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(200)
+        self._poll_timer.timeout.connect(self.context_grabber.poll_external_window)
 
     def _cleanup_old_temp_recordings(self) -> None:
         """Clean orphaned temp audio files from previous crashes or sessions."""
@@ -103,21 +120,47 @@ class StateCoordinator(QObject):
         self.recording_stopped.connect(self._handle_recording_stopped)
         self.transcription_finished.connect(self._handle_transcription_finished)
         self.transcription_failed.connect(self._handle_transcription_failed)
+        self.note_refined.connect(self._handle_note_refined)
         self.no_speech_detected.connect(self._handle_no_speech_detected)
         self.error_occurred.connect(self._handle_error_occurred)
 
         # Tray signals
         self.tray.signals.open_library_requested.connect(self.open_library)
+        self.tray.signals.open_settings_requested.connect(self.open_settings)
+        self.tray.signals.toggle_overlay_requested.connect(self.toggle_overlay)
         self.tray.signals.toggle_recording_requested.connect(self.toggle_recording)
         self.tray.signals.cancel_recording_requested.connect(self.cancel_recording)
         self.tray.signals.retry_last_requested.connect(self.retry_last_failed)
         self.tray.signals.discard_last_requested.connect(self.discard_last_failed)
         self.tray.signals.quit_requested.connect(self.quit_application)
 
+        # Overlay signals
+        self.overlay.toggle_recording_requested.connect(self.toggle_recording)
+        self.overlay.cancel_recording_requested.connect(self.cancel_recording)
+        self.overlay.open_library_requested.connect(self.open_library)
+        self.overlay.screenshot_attached.connect(self._on_screenshot_attached)
+        self.overlay.copy_text_requested.connect(self._on_overlay_copied)
+        self.overlay.hide_requested.connect(lambda: self.set_overlay_visibility(False))
+
+        # Library signals
+        self.library_window.overlay_visibility_toggled.connect(self.set_overlay_visibility)
+        self.library_window.notifications_enabled_toggled.connect(self.set_notifications_enabled)
+        self.library_window.whisper_model_changed.connect(self._on_model_changed)
+        self.library_window.whisper_language_changed.connect(self._on_language_changed)
+        self.library_window.refinement_engine_changed.connect(self._on_refinement_engine_changed)
+        self.library_window.llm_model_changed.connect(self._on_llm_model_changed)
+
     def start(self) -> None:
-        """Start the app, register hotkey, show tray icon."""
+        """Start the app, register hotkey, show tray icon and overlay."""
         self.tray.show()
         self.tray.update_state("ready")
+        self.tray.set_overlay_visible(self.settings.overlay_visible)
+
+        if self.settings.overlay_visible:
+            self.overlay.show()
+
+        # Start external window poll timer
+        self._poll_timer.start()
 
         # Preload whisper model in background thread
         threading.Thread(target=self._preload_whisper, daemon=True).start()
@@ -128,10 +171,10 @@ class StateCoordinator(QObject):
             logger.info("Application ready. Hotkey: %s", self.config.hotkey_str)
         except HotkeyRegistrationError as e:
             logger.warning("Hotkey conflict on startup: %s", e)
-            self.tray.showMessage(
-                "Thought Capture — Hinweis",
-                f"Globaler Hotkey {self.config.hotkey_str} ist belegt.\n"
-                f"Aufnahmen können stattdessen über das Tray-Menü gestartet werden.",
+            self._show_tray_message(
+                "Thought Capture — Notice",
+                f"Global hotkey {self.config.hotkey_str} is already in use.\n"
+                f"You can use the floating overlay or tray menu instead.",
                 QSystemTrayIcon.Warning,
                 5000,
             )
@@ -144,36 +187,124 @@ class StateCoordinator(QObject):
         except Exception as e:
             logger.warning("Preloading whisper model failed: %s", e)
 
+    def _show_tray_message(
+        self,
+        title: str,
+        message: str,
+        icon: QSystemTrayIcon.MessageIcon = QSystemTrayIcon.Information,
+        msecs: int = 3000,
+    ) -> None:
+        """Show system notification popup if enabled in settings."""
+        if self.settings.show_notifications:
+            self.tray.showMessage(title, message, icon, msecs)
+
     def _on_hotkey_thread_callback(self) -> None:
         """Called directly on Win32 message loop thread when WM_HOTKEY fires."""
-        # IF we are ready to start recording, capture foreground window right NOW
-        # before any UI interaction!
         if self.state == "ready":
-            self._current_context = self.context_grabber.capture_active_window()
-        # Post event to Qt main thread
+            self._current_context = self.context_grabber.capture_active_window(allow_self=False)
         self.hotkey_pressed.emit()
 
     def _on_max_duration_reached(self) -> None:
         """Watchdog callback when max recording limit is reached."""
         self.hotkey_pressed.emit()
 
+    @Slot(object)
+    def _on_screenshot_attached(self, path: Path | None) -> None:
+        self._attached_screenshot = path
+        logger.info("Screenshot attachment updated: %s", path)
+
+    @Slot(str)
+    def _on_overlay_copied(self, text: str) -> None:
+        self._show_tray_message("Thought Capture", "Text copied to clipboard.", QSystemTrayIcon.Information, 1500)
+
+    @Slot()
+    def toggle_overlay(self) -> None:
+        """Toggle floating overlay visibility from tray menu."""
+        new_visible = not self.overlay.isVisible()
+        self.set_overlay_visibility(new_visible)
+
+    @Slot(bool)
+    def set_overlay_visibility(self, visible: bool) -> None:
+        """Set overlay visibility and persist preference."""
+        self.overlay.setVisible(visible)
+        self.tray.set_overlay_visible(visible)
+        self.settings.overlay_visible = visible
+        self.settings.save()
+        self.library_window.update_overlay_checkbox(visible)
+
+    @Slot(bool)
+    def set_notifications_enabled(self, enabled: bool) -> None:
+        """Set Windows notification popups preference and persist."""
+        self.settings.show_notifications = enabled
+        self.settings.save()
+        self.library_window.update_notifications_checkbox(enabled)
+
+    @Slot()
+    def open_settings(self) -> None:
+        """Open Library window and expand settings panel."""
+        self.open_library()
+        self.library_window.open_settings()
+
+    @Slot(str)
+    def _on_model_changed(self, model: str) -> None:
+        self.settings.whisper_model = model
+        self.settings.save()
+        self.transcriber.update_config(model_size_or_path=model)
+        self._show_tray_message("Thought Capture", f"Whisper Model auf '{model}' gesetzt. Preloading...", QSystemTrayIcon.Information, 2500)
+
+    @Slot(str)
+    def _on_language_changed(self, lang: str) -> None:
+        self.settings.whisper_language = lang
+        self.settings.save()
+        self.transcriber.update_config(language=lang)
+        self._show_tray_message("Thought Capture", f"Sprache auf '{lang}' gesetzt.", QSystemTrayIcon.Information, 2000)
+
+    @Slot(str)
+    def _on_refinement_engine_changed(self, engine: str) -> None:
+        self.settings.refinement_engine = engine
+        self.settings.save()
+        try:
+            self.text_processor.stop()
+        except Exception:
+            pass
+        self.text_processor = get_default_text_processor(
+            engine=engine,
+            model_key=self.settings.llm_model,
+        )
+        self.library_window.set_text_processor(self.text_processor)
+        self._show_tray_message("Thought Capture", f"Textverarbeitung: '{engine}'", QSystemTrayIcon.Information, 2000)
+
+    @Slot(str)
+    def _on_llm_model_changed(self, model: str) -> None:
+        self.settings.llm_model = model
+        self.settings.save()
+        if hasattr(self.text_processor, "update_model"):
+            self.text_processor.update_model(model)
+        else:
+            self.text_processor = get_default_text_processor(
+                engine=self.settings.refinement_engine,
+                model_key=model,
+            )
+            self.library_window.set_text_processor(self.text_processor)
+        self._show_tray_message("Thought Capture", f"LLM-Modell: '{model}'", QSystemTrayIcon.Information, 2000)
+
     @Slot()
     def toggle_recording(self) -> None:
-        """Main hotkey action: starts if ready, stops if recording."""
+        """Main action: starts if ready, stops if recording (unified for button & hotkey)."""
         if self.state == "ready":
             self._start_recording()
         elif self.state == "recording":
             self._stop_recording()
         elif self.state == "processing":
-            logger.debug("Hotkey ignored while processing.")
+            logger.debug("Action ignored while processing.")
         elif self.state == "error":
-            # Start fresh capture on hotkey even if previous had an error
             self.discard_last_failed()
             self._start_recording()
 
     def _start_recording(self) -> None:
+        # If context not yet captured (e.g. triggered via overlay button click), grab now
         if not self._current_context:
-            self._current_context = self.context_grabber.capture_active_window()
+            self._current_context = self.context_grabber.capture_active_window(allow_self=False)
 
         temp_dir = get_temp_audio_dir()
         self._current_wav_path = temp_dir / f"capture_{uuid.uuid4().hex}.wav"
@@ -185,48 +316,123 @@ class StateCoordinator(QObject):
         except NoMicrophoneError:
             self.state = "ready"
             self._current_context = None
-            self.error_occurred.emit("Kein Mikrofon gefunden.")
+            self.error_occurred.emit("No microphone or audio input device found.")
         except AudioError as e:
             self.state = "ready"
             self._current_context = None
-            self.error_occurred.emit(f"Audio-Fehler: {e}")
+            self.error_occurred.emit(f"Audio error: {e}")
 
     def _stop_recording(self) -> None:
         self.state = "processing"
         self.tray.update_state("processing")
+        self.overlay.update_state("processing")
 
         wav_path = self._current_wav_path
-        ctx = self._current_context or self.context_grabber.capture_active_window()
+        ctx = self._current_context or self.context_grabber.capture_active_window(allow_self=False)
+        screenshot_path = str(self._attached_screenshot) if self._attached_screenshot and self._attached_screenshot.exists() else None
 
         self._current_wav_path = None
         self._current_context = None
+        self._attached_screenshot = None
 
-        # Execute audio stop and transcription in background worker thread
         def worker():
             saved_path, duration = self.recorder.stop(wav_path)
             if not saved_path or duration < 0.3 or not saved_path.exists():
                 self.no_speech_detected.emit()
                 if saved_path and saved_path.exists():
                     saved_path.unlink()
+                if screenshot_path and Path(screenshot_path).exists():
+                    try:
+                        Path(screenshot_path).unlink()
+                    except Exception:
+                        pass
                 return
 
             try:
-                res = self.transcriber.transcribe(saved_path)
-                if not res.text.strip():
+                prompt = build_default_prompt(
+                    application=ctx.application,
+                    window_title=ctx.window_title,
+                    language=self.settings.whisper_language,
+                )
+                res = self.transcriber.transcribe(
+                    saved_path,
+                    initial_prompt=prompt,
+                    language=self.settings.whisper_language,
+                )
+                raw_text = res.text.strip()
+                if not raw_text:
                     self.no_speech_detected.emit()
                     saved_path.unlink()
+                    if screenshot_path and Path(screenshot_path).exists():
+                        try:
+                            Path(screenshot_path).unlink()
+                        except Exception:
+                            pass
                     return
+
+                # Instant Rule-Based Normalization (<1ms)
+                rule_proc = RuleBasedTextProcessor()
+                fast_proc_res = rule_proc.process(
+                    raw_text,
+                    context_app=ctx.application,
+                    context_window=ctx.window_title,
+                    language=self.settings.whisper_language,
+                )
+                fast_text_processed = (
+                    fast_proc_res.text if (fast_proc_res.success and fast_proc_res.text != raw_text) else None
+                )
+                fast_category = fast_proc_res.category if fast_proc_res.success else None
+                fast_tags = fast_proc_res.tags if fast_proc_res.success else []
 
                 note = Note(
                     id=str(uuid.uuid4()),
                     captured_at_utc=ctx.captured_at_utc,
-                    transcript=res.text.strip(),
+                    transcript=raw_text,
+                    original_transcript=raw_text,
+                    text_processed=fast_text_processed,
+                    processed_by="rules" if fast_text_processed else None,
+                    category=fast_category,
+                    tags=fast_tags,
+                    screenshot_path=screenshot_path,
                     application=ctx.application,
                     window_title=ctx.window_title,
                 )
                 self.repository.save(note)
                 saved_path.unlink()  # Audio deleted upon successful note save
+
+                # Instant UI emit (<1s response for user)
                 self.transcription_finished.emit(note)
+
+                # Async LLM Refinement & Categorization in background (non-blocking)
+                if self.settings.refinement_engine == "llm":
+                    note_id = note.id
+                    app_name = ctx.application
+                    win_title = ctx.window_title
+                    lang = self.settings.whisper_language
+
+                    def bg_llm_worker():
+                        try:
+                            llm_res = self.text_processor.process(
+                                raw_text,
+                                context_app=app_name,
+                                context_window=win_title,
+                                language=lang,
+                            )
+                            if llm_res.success:
+                                refined_text = llm_res.text if llm_res.text != raw_text else None
+                                updated = self.repository.update_processed_text(
+                                    note_id,
+                                    text_processed=refined_text or (fast_text_processed or ""),
+                                    processed_by=llm_res.processor_id,
+                                    category=llm_res.category or fast_category,
+                                    tags=llm_res.tags or fast_tags,
+                                )
+                                if updated:
+                                    self.note_refined.emit(updated)
+                        except Exception as e:
+                            logger.warning("Background LLM processing failed: %s", e)
+
+                    threading.Thread(target=bg_llm_worker, daemon=True).start()
 
             except Exception as exc:
                 logger.error("Processing failed: %s", exc)
@@ -236,7 +442,7 @@ class StateCoordinator(QObject):
 
     @Slot()
     def cancel_recording(self) -> None:
-        """Cancel ongoing recording immediately and discard audio."""
+        """Cancel ongoing recording immediately and discard audio & screenshot."""
         if self.state == "recording":
             self.recorder.cancel()
             if self._current_wav_path and self._current_wav_path.exists():
@@ -244,39 +450,77 @@ class StateCoordinator(QObject):
                     self._current_wav_path.unlink()
                 except Exception:
                     pass
+            if self._attached_screenshot and self._attached_screenshot.exists():
+                try:
+                    self._attached_screenshot.unlink()
+                except Exception:
+                    pass
+
             self._current_wav_path = None
             self._current_context = None
+            self._attached_screenshot = None
             self.state = "ready"
             self.tray.update_state("ready")
-            self.tray.showMessage("Thought Capture", "Aufnahme abgebrochen.", QSystemTrayIcon.Information, 1500)
+            self.overlay.update_state("ready")
+            self._show_tray_message("Thought Capture", "Recording canceled.", QSystemTrayIcon.Information, 1500)
 
     @Slot()
     def retry_last_failed(self) -> None:
         """Retry transcribing the last failed audio recording."""
         if not self._last_failed_wav or not self._last_failed_wav.exists():
-            self.tray.showMessage("Thought Capture", "Keine gespeicherte Aufnahme zum Wiederholen vorhanden.", QSystemTrayIcon.Warning, 2000)
+            self._show_tray_message("Thought Capture", "No saved recording to retry.", QSystemTrayIcon.Warning, 2000)
             self.state = "ready"
             self.tray.update_state("ready")
+            self.overlay.update_state("ready")
             return
 
         self.state = "processing"
         self.tray.update_state("processing")
+        self.overlay.update_state("processing")
 
         wav_path = self._last_failed_wav
         ctx = self._last_failed_context or WindowContext()
 
         def worker():
             try:
-                res = self.transcriber.transcribe(wav_path)
-                if not res.text.strip():
+                prompt = build_default_prompt(
+                    application=ctx.application,
+                    window_title=ctx.window_title,
+                    language=self.settings.whisper_language,
+                )
+                res = self.transcriber.transcribe(
+                    wav_path,
+                    initial_prompt=prompt,
+                    language=self.settings.whisper_language,
+                )
+                raw_text = res.text.strip()
+                if not raw_text:
                     self.no_speech_detected.emit()
                     wav_path.unlink()
                     return
 
+                rule_proc = RuleBasedTextProcessor()
+                fast_proc_res = rule_proc.process(
+                    raw_text,
+                    context_app=ctx.application,
+                    context_window=ctx.window_title,
+                    language=self.settings.whisper_language,
+                )
+                fast_text_processed = (
+                    fast_proc_res.text if (fast_proc_res.success and fast_proc_res.text != raw_text) else None
+                )
+                fast_category = fast_proc_res.category if fast_proc_res.success else None
+                fast_tags = fast_proc_res.tags if fast_proc_res.success else []
+
                 note = Note(
                     id=str(uuid.uuid4()),
                     captured_at_utc=ctx.captured_at_utc,
-                    transcript=res.text.strip(),
+                    transcript=raw_text,
+                    original_transcript=raw_text,
+                    text_processed=fast_text_processed,
+                    processed_by="rules" if fast_text_processed else None,
+                    category=fast_category,
+                    tags=fast_tags,
                     application=ctx.application,
                     window_title=ctx.window_title,
                 )
@@ -285,6 +529,37 @@ class StateCoordinator(QObject):
                 self._last_failed_wav = None
                 self._last_failed_context = None
                 self.transcription_finished.emit(note)
+
+                if self.settings.refinement_engine == "llm":
+                    note_id = note.id
+                    app_name = ctx.application
+                    win_title = ctx.window_title
+                    lang = self.settings.whisper_language
+
+                    def bg_llm_worker():
+                        try:
+                            llm_res = self.text_processor.process(
+                                raw_text,
+                                context_app=app_name,
+                                context_window=win_title,
+                                language=lang,
+                            )
+                            if llm_res.success:
+                                refined_text = llm_res.text if llm_res.text != raw_text else None
+                                updated = self.repository.update_processed_text(
+                                    note_id,
+                                    text_processed=refined_text or (fast_text_processed or ""),
+                                    processed_by=llm_res.processor_id,
+                                    category=llm_res.category or fast_category,
+                                    tags=llm_res.tags or fast_tags,
+                                )
+                                if updated:
+                                    self.note_refined.emit(updated)
+                        except Exception as e:
+                            logger.warning("Background LLM processing failed on retry: %s", e)
+
+                    threading.Thread(target=bg_llm_worker, daemon=True).start()
+
             except Exception as exc:
                 self.transcription_failed.emit(str(exc), wav_path, ctx)
 
@@ -302,14 +577,16 @@ class StateCoordinator(QObject):
         self._last_failed_context = None
         self.state = "ready"
         self.tray.update_state("ready")
+        self.overlay.update_state("ready")
 
     # Slot Handlers
     @Slot()
     def _handle_recording_started(self) -> None:
         self.tray.update_state("recording")
-        self.tray.showMessage(
+        self.overlay.update_state("recording")
+        self._show_tray_message(
             "Thought Capture",
-            f"🎙️ Recording...\nPress {self.config.hotkey_str} again to finish.",
+            f"🎙️ Recording...\nPress {self.config.hotkey_str} or overlay button to finish.",
             QSystemTrayIcon.Information,
             2000,
         )
@@ -317,24 +594,38 @@ class StateCoordinator(QObject):
     @Slot(object, object)
     def _handle_recording_stopped(self, wav_path: Path, ctx: WindowContext) -> None:
         self.tray.update_state("processing")
+        self.overlay.update_state("processing")
 
     @Slot(object)
     def _handle_transcription_finished(self, note: Note) -> None:
         self.state = "ready"
         self.tray.update_state("ready")
 
+        # Determine preferred text version for display / clipboard
+        chosen_text = note.display_text(self.settings.default_text_version)
+
+        # Auto-copy to clipboard if enabled in settings
+        auto_copied = False
+        if self.settings.auto_copy_clipboard and chosen_text:
+            QApplication.clipboard().setText(chosen_text)
+            auto_copied = True
+
+        self.overlay.update_state("saved", result_text=chosen_text)
+
         # Refresh library if visible
         if self.library_window.isVisible():
             self.library_window.refresh_notes()
 
-        preview = note.transcript
+        preview = chosen_text
         if len(preview) > 60:
             preview = preview[:57] + "..."
 
         ctx_str = f" [{note.application}]" if note.application else ""
-        self.tray.showMessage(
+        copied_suffix = " (Copied to clipboard)" if auto_copied else ""
+
+        self._show_tray_message(
             "Thought Capture — Saved",
-            f"✅{ctx_str} {preview}",
+            f"✅{ctx_str} {preview}{copied_suffix}",
             QSystemTrayIcon.Information,
             3000,
         )
@@ -345,7 +636,8 @@ class StateCoordinator(QObject):
         self._last_failed_wav = wav_path
         self._last_failed_context = ctx
         self.tray.update_state("error", "Transcription error")
-        self.tray.showMessage(
+        self.overlay.update_state("error", detail_message="Transcription error")
+        self._show_tray_message(
             "Thought Capture — Error",
             f"Transcription failed: {error_str}\n"
             f"Audio preserved. Click 'Retry' or 'Discard' in tray menu.",
@@ -353,11 +645,26 @@ class StateCoordinator(QObject):
             6000,
         )
 
+    @Slot(object)
+    def _handle_note_refined(self, note: Note) -> None:
+        logger.info("Note %s asynchronously refined and categorized.", note.id)
+        if self.library_window.isVisible():
+            self.library_window.refresh_notes()
+        if (
+            self.settings.default_text_version == "processed"
+            and self.settings.auto_copy_clipboard
+            and note.text_processed
+        ):
+            current_clipboard = QApplication.clipboard().text()
+            if current_clipboard in (note.transcript, note.original_transcript):
+                QApplication.clipboard().setText(note.text_processed)
+
     @Slot()
     def _handle_no_speech_detected(self) -> None:
         self.state = "ready"
         self.tray.update_state("ready")
-        self.tray.showMessage(
+        self.overlay.update_state("ready")
+        self._show_tray_message(
             "Thought Capture",
             "No speech detected. Recording discarded.",
             QSystemTrayIcon.Warning,
@@ -368,7 +675,8 @@ class StateCoordinator(QObject):
     def _handle_error_occurred(self, message: str) -> None:
         self.state = "ready"
         self.tray.update_state("ready")
-        self.tray.showMessage(
+        self.overlay.update_state("ready")
+        self._show_tray_message(
             "Thought Capture — Notice",
             message,
             QSystemTrayIcon.Warning,
@@ -387,8 +695,13 @@ class StateCoordinator(QObject):
     def quit_application(self) -> None:
         """Clean shutdown of hotkey, recorder, and app."""
         logger.info("Quitting application...")
+        self._poll_timer.stop()
         if self.state == "recording":
             self.recorder.cancel()
         self.hotkey_listener.stop()
+        try:
+            self.text_processor.stop()
+        except Exception:
+            pass
         self._cleanup_old_temp_recordings()
         QApplication.quit()
