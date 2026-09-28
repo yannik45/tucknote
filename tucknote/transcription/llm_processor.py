@@ -44,6 +44,42 @@ MODELS = {
 LLAMA_BIN_URL = "https://github.com/ggerganov/llama.cpp/releases/download/b3600/llama-b3600-bin-win-avx2-x64.zip"
 
 
+def get_llm_model_path(model_key: str) -> Path | None:
+    """Get the path to a downloaded GGUF LLM model file on disk."""
+    if model_key not in MODELS:
+        return None
+    return get_data_dir() / "models" / MODELS[model_key]["filename"]
+
+
+def is_llm_model_cached(model_key: str) -> bool:
+    """Check if an LLM model GGUF file is already downloaded and present on disk."""
+    path = get_llm_model_path(model_key)
+    return path.exists() and path.stat().st_size > 1024 * 1024 if path else False
+
+
+def get_llm_model_size_mb(model_key: str) -> float:
+    """Return the disk size of the LLM model file in megabytes, or 0.0 if not downloaded."""
+    path = get_llm_model_path(model_key)
+    if not path or not path.exists():
+        return 0.0
+    return round(path.stat().st_size / (1024 * 1024), 1)
+
+
+
+def delete_llm_model(model_key: str) -> bool:
+    """Delete a downloaded LLM model GGUF file to reclaim disk space."""
+    path = get_llm_model_path(model_key)
+    if not path or not path.exists():
+        return False
+    try:
+        logger.info("Deleting LLM model '%s' at %s...", model_key, path)
+        path.unlink()
+        return True
+    except Exception as e:
+        logger.error("Failed to delete LLM model '%s': %s", model_key, e)
+        return False
+
+
 class LocalLLMProcessor:
     """Manages an embedded, local llama-server instance for text refinement & classification."""
 
@@ -216,16 +252,15 @@ class LocalLLMProcessor:
             return self._fallback.process(cleaned_raw, context_app, context_window, language)
 
         system_prompt = (
-            "Du bist ein intelligenter Text-Editor für spontane Sprachnotizen. "
-            "Deine Aufgabe:\n"
-            "1. Bereinige Grammatik, Zeichensetzung und Tipp-/Hörfehler im Transkript.\n"
-            "2. Berücksichtige den aktiven Fenstertitel für Fachbegriffe und Dateinamen.\n"
-            "3. Entferne Füllwörter wie 'also', 'ähm', 'irgendwie', 'halt'.\n"
-            "4. Wähle genau eine Kategorie aus: ['Task', 'Bug', 'Idea', 'Note'].\n"
-            "5. Vergib 1 bis 3 kurze Tags.\n\n"
+            "Du bist ein intelligenter Assistent für Sprachnotizen.\n"
+            "Deine Aufgabe: Analysiere das Transkript und den Kontext, wähle genau EINE Kategorie und vergib 1 bis 3 kurze Tags.\n\n"
+            "Kategorien:\n"
+            "- 'Task': Konkrete Aufgabe, Todo, Vorhaben, Bug fixen, etwas erledigen\n"
+            "- 'Bug': Fehler, Problem, Crash, unerwartetes Verhalten, Defekt\n"
+            "- 'Idea': Neue Idee, Feature-Vorschlag, Inspiration, Konzept\n"
+            "- 'Note': Allgemeine Information, Notiz, Dokumentation, Gedanke\n\n"
             "Antworte AUSSCHLIESSLICH im folgenden JSON-Format:\n"
             "{\n"
-            '  "text_processed": "...",\n'
             '  "category": "Task",\n'
             '  "tags": ["tag1", "tag2"]\n'
             "}"
@@ -246,7 +281,7 @@ class LocalLLMProcessor:
                 {"role": "user", "content": user_content},
             ],
             "temperature": 0.1,
-            "max_tokens": 160,
+            "max_tokens": 80,
         }
 
         chat_url = f"http://127.0.0.1:{self.port}/v1/chat/completions"
@@ -257,7 +292,7 @@ class LocalLLMProcessor:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
             content = data["choices"][0]["message"]["content"].strip()
@@ -268,7 +303,6 @@ class LocalLLMProcessor:
                     content = content[4:].strip()
 
             parsed = json.loads(content.strip())
-            processed_text = str(parsed.get("text_processed", "")).strip() or cleaned_raw
             category = str(parsed.get("category", "Note")).strip()
             if category not in ["Task", "Bug", "Idea", "Note"]:
                 # Normalization
@@ -284,9 +318,9 @@ class LocalLLMProcessor:
 
             tags = [str(t).strip() for t in parsed.get("tags", []) if t][:3]
 
-            logger.info("LLM processed note: [%s] tags=%s", category, tags)
+            logger.info("LLM categorized note: [%s] tags=%s", category, tags)
             return ProcessedTextResult(
-                text=processed_text,
+                text=cleaned_raw,
                 processor_id=self.processor_id,
                 success=True,
                 category=category,

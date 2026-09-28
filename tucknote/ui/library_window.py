@@ -1,14 +1,16 @@
-"""Library Window for Thought Capture (tucknote).
+"""Library Window for Tucknote.
 
-Displays notes in a clean, modern, minimalist three-pane interface:
-- Left Sidebar: Category filters (All, Tasks, Bugs, Ideas, Notes, Screenshots) with live counts
-- Center Pane: Search & filterable note card list
-- Right Pane: Note detail inspector with instant category editing, dual transcripts, screenshot actions, and settings.
+Displays notes in an Apple- and ChatGPT-inspired minimalist interface:
+- Left Sidebar: Brand, Category filters (All, Tasks, Bugs, Ideas, Notes, Screenshots), Settings nav
+- Main Area (QStackedWidget):
+  - Page 0: Notes workspace (Search & note card list | Note detail inspector)
+  - Page 1: Dedicated Settings view with Apple-style grouped cards, ToggleSwitches, and Model Manager
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from datetime import datetime
 from PySide6.QtCore import Qt, Signal, QUrl, QSize
@@ -28,19 +30,175 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QStatusBar,
-    QTabWidget,
-    QCheckBox,
     QComboBox,
+    QListView,
+    QProgressBar,
+    QStackedWidget,
+    QScrollArea,
 )
 from PySide6.QtGui import QFont, QColor, QDesktopServices, QPixmap, QIcon
 
-from tucknote.config import AppSettings
+from tucknote.config import AppSettings, get_data_dir, APP_DISPLAY_NAME
+
 from tucknote.storage.models import Note
 from tucknote.storage.repository import NoteRepository
+from tucknote.transcription.transcriber import (
+    is_whisper_model_cached,
+    get_whisper_model_size_mb,
+    delete_whisper_model,
+)
+from tucknote.transcription.llm_processor import (
+    is_llm_model_cached,
+    get_llm_model_size_mb,
+    delete_llm_model,
+)
 from tucknote.transcription.processor import get_default_text_processor
-from tucknote.ui.vector_icons import get_vector_icon, get_vector_pixmap, CATEGORY_THEMES
+from tucknote.ui.vector_icons import (
+    get_vector_icon,
+    get_vector_pixmap,
+    get_chevron_icon_path,
+    CATEGORY_THEMES,
+)
+from tucknote.ui.toggle_switch import ToggleSwitch
 
 logger = logging.getLogger("tucknote")
+
+
+def _build_global_stylesheet() -> str:
+    chevron_path = get_chevron_icon_path()
+    return f"""
+QWidget {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #18181b;
+}}
+
+/* Disable all default borders and backgrounds on text labels */
+QLabel {{
+    border: none;
+    background: transparent;
+}}
+
+/* Apple / ChatGPT Grouped Card */
+QFrame#settingsCard {{
+    background-color: #ffffff;
+    border: 1px solid #e4e4e7;
+    border-radius: 12px;
+}}
+
+/* Sleek Apple-style Dropdown */
+QComboBox {{
+    border: 1px solid #e4e4e7;
+    border-radius: 8px;
+    background-color: #ffffff;
+    padding: 6px 30px 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #18181b;
+}}
+QComboBox:hover {{
+    border-color: #a1a1aa;
+    background-color: #fafafa;
+}}
+QComboBox:focus {{
+    border-color: #18181b;
+}}
+QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 26px;
+    border: none;
+    background: transparent;
+}}
+QComboBox::down-arrow {{
+    image: url({chevron_path});
+    width: 10px;
+    height: 10px;
+}}
+QComboBox QAbstractItemView,
+QComboBox QListView,
+QFrame.QComboBoxPrivateContainer {{
+    background-color: #ffffff;
+    color: #18181b;
+    border: 1px solid #e4e4e7;
+    border-radius: 8px;
+    padding: 4px;
+    outline: none;
+}}
+QComboBox QAbstractItemView::item,
+QComboBox QListView::item {{
+    background-color: #ffffff;
+    color: #18181b;
+    padding: 7px 12px;
+    border-radius: 6px;
+    min-height: 22px;
+}}
+QComboBox QAbstractItemView::item:hover,
+QComboBox QAbstractItemView::item:selected,
+QComboBox QListView::item:hover,
+QComboBox QListView::item:selected {{
+    background-color: #f4f4f5;
+    color: #09090b;
+}}
+
+
+/* Minimalist Ultra-Thin 6px Scrollbars */
+
+QScrollBar:vertical {{
+    border: none;
+    background: transparent;
+    width: 6px;
+    margin: 0px;
+}}
+QScrollBar::handle:vertical {{
+    background: #d4d4d8;
+    min-height: 24px;
+    border-radius: 3px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: #a1a1aa;
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    border: none;
+    background: none;
+    height: 0px;
+}}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    background: none;
+}}
+QScrollBar:horizontal {{
+    border: none;
+    background: transparent;
+    height: 6px;
+    margin: 0px;
+}}
+QScrollBar::handle:horizontal {{
+    background: #d4d4d8;
+    min-width: 24px;
+    border-radius: 3px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: #a1a1aa;
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    border: none;
+    background: none;
+    width: 0px;
+}}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+    background: none;
+}}
+"""
+
+
+def _setup_apple_combobox(cb: QComboBox) -> None:
+    """Ensure combobox uses a styled QListView popup matching Apple/ChatGPT aesthetics."""
+    view = QListView()
+    view.setStyleSheet(
+        "QListView { background-color: #ffffff; color: #18181b; border: 1px solid #e4e4e7; border-radius: 8px; padding: 4px; outline: none; }"
+        "QListView::item { background-color: #ffffff; color: #18181b; padding: 7px 12px; border-radius: 6px; min-height: 22px; }"
+        "QListView::item:hover, QListView::item:selected { background-color: #f4f4f5; color: #09090b; }"
+    )
+    cb.setView(view)
 
 
 class NoteListItemWidget(QWidget):
@@ -52,15 +210,15 @@ class NoteListItemWidget(QWidget):
         self.settings = settings
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(5)
 
         # Header: Category Badge + Timestamp + App Chip + Attachments
         header_layout = QHBoxLayout()
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(6)
 
-        # Category badge (modern vector icon + subtle pill)
+        # Category badge (modern vector icon + clean text)
         cat = note.category or "Note"
         theme = CATEGORY_THEMES.get(cat, CATEGORY_THEMES["Note"])
         cat_badge = QLabel()
@@ -69,7 +227,7 @@ class NoteListItemWidget(QWidget):
 
         cat_name = QLabel(theme["label"])
         cat_name.setStyleSheet(
-            f"color: {theme['color']}; font-size: 11px; font-weight: 700;"
+            f"color: {theme['color']}; font-size: 11px; font-weight: 600;"
         )
         header_layout.addWidget(cat_name)
 
@@ -79,15 +237,15 @@ class NoteListItemWidget(QWidget):
         local_dt = note.captured_at_local
         time_str = local_dt.strftime("%d %b %H:%M")
         self.time_label = QLabel(time_str)
-        self.time_label.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.time_label.setStyleSheet("color: #71717a; font-size: 11px;")
         header_layout.addWidget(self.time_label)
 
         header_layout.addStretch()
 
-        # Screenshot indicator (clean vector icon)
+        # Screenshot indicator (clean vector camera icon)
         if note.has_screenshot:
             cam_badge = QLabel()
-            cam_badge.setPixmap(get_vector_pixmap("camera", color="#7c3aed", size=13))
+            cam_badge.setPixmap(get_vector_pixmap("camera", color="#71717a", size=13))
             cam_badge.setToolTip("Screenshot attached")
             header_layout.addWidget(cam_badge)
 
@@ -95,15 +253,15 @@ class NoteListItemWidget(QWidget):
         if note.is_processed:
             proc_badge = QLabel()
             proc_badge.setPixmap(get_vector_pixmap("sparkles", color="#16a34a", size=13))
-            proc_badge.setToolTip("Refined with AI")
+            proc_badge.setToolTip("Categorized by AI")
             header_layout.addWidget(proc_badge)
 
         # Application chip
         if note.application:
             app_chip = QLabel(note.application.replace(".exe", ""))
             app_chip.setStyleSheet(
-                "background-color: #f1f5f9; color: #475569; border: 1px solid #e2e8f0; "
-                "border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 600;"
+                "background-color: #f4f4f5; color: #52525b; border: 1px solid #e4e4e7; "
+                "border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 500;"
             )
             header_layout.addWidget(app_chip)
 
@@ -118,11 +276,11 @@ class NoteListItemWidget(QWidget):
             title_row.setContentsMargins(0, 0, 0, 0)
             title_row.setSpacing(4)
             win_ico = QLabel()
-            win_ico.setPixmap(get_vector_pixmap("app-window", color="#94a3b8", size=12))
+            win_ico.setPixmap(get_vector_pixmap("app-window", color="#a1a1aa", size=12))
             title_row.addWidget(win_ico)
 
             self.title_label = QLabel(title_text)
-            self.title_label.setStyleSheet("color: #475569; font-size: 11px; font-weight: 500;")
+            self.title_label.setStyleSheet("color: #71717a; font-size: 11px; font-weight: 400;")
             title_row.addWidget(self.title_label)
             title_row.addStretch()
             layout.addLayout(title_row)
@@ -135,7 +293,7 @@ class NoteListItemWidget(QWidget):
         if not preview_text:
             preview_text = "(No text captured)"
         self.preview_label = QLabel(preview_text)
-        self.preview_label.setStyleSheet("color: #1e293b; font-size: 12px; line-height: 1.3;")
+        self.preview_label.setStyleSheet("color: #18181b; font-size: 12px; line-height: 1.35;")
         self.preview_label.setWordWrap(True)
         layout.addWidget(self.preview_label)
 
@@ -147,8 +305,8 @@ class NoteListItemWidget(QWidget):
             for t in note.tags[:3]:
                 tag_lbl = QLabel(f"#{t}")
                 tag_lbl.setStyleSheet(
-                    "background: #f8fafc; color: #6366f1; border: 1px solid #e0e7ff; "
-                    "border-radius: 3px; padding: 0px 4px; font-size: 10px; font-weight: 500;"
+                    "background: #f4f4f5; color: #52525b; border: 1px solid #e4e4e7; "
+                    "border-radius: 3px; padding: 0px 5px; font-size: 10px; font-weight: 500;"
                 )
                 tags_row.addWidget(tag_lbl)
             tags_row.addStretch()
@@ -172,14 +330,14 @@ class SidebarItem(QWidget):
         layout.addWidget(self.icon_label)
 
         self.text_label = QLabel(label)
-        self.text_label.setStyleSheet("font-size: 12px; font-weight: 500; color: #334155;")
+        self.text_label.setStyleSheet("font-size: 12px; font-weight: 500; color: #3f3f46;")
         layout.addWidget(self.text_label)
 
         layout.addStretch()
 
         self.count_badge = QLabel("0")
         self.count_badge.setStyleSheet(
-            "background: #e2e8f0; color: #475569; font-size: 11px; font-weight: 600; "
+            "background: #e4e4e7; color: #52525b; font-size: 11px; font-weight: 600; "
             "border-radius: 9px; padding: 1px 7px;"
         )
         layout.addWidget(self.count_badge)
@@ -197,19 +355,19 @@ class SidebarItem(QWidget):
     def update_style(self) -> None:
         if self.is_active:
             self.setStyleSheet(
-                "SidebarItem { background: #e2e8f0; border-radius: 6px; }"
+                "SidebarItem { background: #e4e4e7; border-radius: 6px; }"
             )
-            self.text_label.setStyleSheet("font-size: 12px; font-weight: 700; color: #0f172a;")
+            self.text_label.setStyleSheet("font-size: 12px; font-weight: 600; color: #09090b;")
         else:
             self.setStyleSheet(
                 "SidebarItem { background: transparent; border-radius: 6px; }"
-                "SidebarItem:hover { background: #f1f5f9; }"
+                "SidebarItem:hover { background: #f4f4f5; }"
             )
-            self.text_label.setStyleSheet("font-size: 12px; font-weight: 500; color: #334155;")
+            self.text_label.setStyleSheet("font-size: 12px; font-weight: 500; color: #3f3f46;")
 
 
 class LibraryWindow(QMainWindow):
-    """Thought Capture Library desktop window."""
+    """Tucknote Library and Settings desktop window."""
 
     note_deleted = Signal(str)
     note_updated = Signal(str, str)
@@ -219,6 +377,8 @@ class LibraryWindow(QMainWindow):
     whisper_language_changed = Signal(str)
     refinement_engine_changed = Signal(str)
     llm_model_changed = Signal(str)
+    streaming_transcription_toggled = Signal(bool)
+    refinement_finished = Signal(str, object)  # (note_id, ProcessedTextResult)
 
     def __init__(self, repository: NoteRepository, settings: AppSettings | None = None, parent=None):
         super().__init__(parent)
@@ -232,11 +392,14 @@ class LibraryWindow(QMainWindow):
             model_key=self.settings.llm_model,
         )
 
-        self.setWindowTitle("Thought Capture — Library")
-        self.setWindowIcon(get_vector_icon("mic", color="#2563eb", size=24))
-        self.resize(1020, 640)
-        self.setMinimumSize(850, 500)
+        self.refinement_finished.connect(self._on_refinement_finished)
 
+        self.setWindowTitle(f"{APP_DISPLAY_NAME} — Library")
+        self.setWindowIcon(get_vector_icon("mic", color="#18181b", size=24))
+        self.resize(1060, 680)
+        self.setMinimumSize(880, 520)
+
+        self.setStyleSheet(_build_global_stylesheet())
         self._init_ui()
         self.refresh_notes()
 
@@ -247,87 +410,92 @@ class LibraryWindow(QMainWindow):
     def _init_ui(self) -> None:
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
-        central_widget.setStyleSheet("background: #f8fafc;")
+        central_widget.setStyleSheet("background: #fafafa;")
 
-        window_layout = QVBoxLayout(central_widget)
-        window_layout.setContentsMargins(0, 0, 0, 0)
-        window_layout.setSpacing(0)
+        root_layout = QHBoxLayout(central_widget)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        # 1. Collapsible Settings Drawer
-        self._build_settings_panel()
-        window_layout.addWidget(self.settings_panel)
-
-        # 2. Main Three-Pane Workspace (Sidebar | Note List | Details)
-        workspace = QSplitter(Qt.Horizontal)
-        workspace.setStyleSheet(
-            "QSplitter::handle { background: #e2e8f0; width: 1px; }"
-        )
-
-        # Pane 1: Left Navigation Sidebar
+        # 1. Left Sidebar
         self.sidebar_widget = self._build_sidebar()
-        workspace.addWidget(self.sidebar_widget)
+        root_layout.addWidget(self.sidebar_widget)
 
-        # Pane 2: Middle Note List
-        list_container = self._build_note_list_pane()
-        workspace.addWidget(list_container)
+        # 2. Main Stacked Widget (Page 0: Notes Workspace, Page 1: Dedicated Settings View)
+        self.main_stack = QStackedWidget()
+        self.main_stack.setStyleSheet("background: #fafafa;")
 
-        # Pane 3: Right Note Inspector
-        detail_container = self._build_detail_pane()
-        workspace.addWidget(detail_container)
+        # Page 0: Notes Splitter (Note List | Detail Inspector)
+        self.notes_workspace = QSplitter(Qt.Horizontal)
+        self.notes_workspace.setStyleSheet(
+            "QSplitter::handle { background: #e4e4e7; width: 1px; }"
+        )
+        self.note_list_container = self._build_note_list_pane()
+        self.notes_workspace.addWidget(self.note_list_container)
 
-        # Splitter ratios: Sidebar 20%, List 35%, Details 45%
-        workspace.setSizes([200, 350, 470])
-        workspace.setStretchFactor(0, 0)
-        workspace.setStretchFactor(1, 4)
-        workspace.setStretchFactor(2, 6)
+        self.detail_container = self._build_detail_pane()
+        self.notes_workspace.addWidget(self.detail_container)
 
-        window_layout.addWidget(workspace)
+        self.notes_workspace.setSizes([380, 500])
+        self.notes_workspace.setStretchFactor(0, 4)
+        self.notes_workspace.setStretchFactor(1, 6)
+
+        self.main_stack.addWidget(self.notes_workspace)
+
+        # Page 1: Apple-style Settings View
+        self.settings_panel = self._build_settings_view()
+        self.main_stack.addWidget(self.settings_panel)
+
+        # Default to notes view
+        self.main_stack.setCurrentIndex(0)
+        self.settings_panel.setVisible(False)
+
+        root_layout.addWidget(self.main_stack, 1)
 
         # Status Bar
         self.status_bar = QStatusBar()
         self.status_bar.setStyleSheet(
-            "QStatusBar { background: #ffffff; border-top: 1px solid #e2e8f0; color: #64748b; font-size: 11px; padding: 2px 10px; }"
+            "QStatusBar { background: #ffffff; border-top: 1px solid #e4e4e7; color: #71717a; font-size: 11px; padding: 2px 12px; }"
         )
         self.setStatusBar(self.status_bar)
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
-        sidebar.setMinimumWidth(180)
+        sidebar.setMinimumWidth(190)
         sidebar.setMaximumWidth(230)
-        sidebar.setStyleSheet("background: #f8fafc; border-right: 1px solid #e2e8f0;")
+        sidebar.setStyleSheet("background: #f4f4f5; border-right: 1px solid #e4e4e7;")
 
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(10, 14, 10, 12)
+        layout.setContentsMargins(12, 16, 12, 14)
         layout.setSpacing(6)
 
         # App Brand Header
         brand_row = QHBoxLayout()
-        brand_row.setContentsMargins(6, 0, 6, 8)
+        brand_row.setContentsMargins(6, 0, 6, 10)
         brand_row.setSpacing(8)
 
         logo_lbl = QLabel()
-        logo_lbl.setPixmap(get_vector_pixmap("sparkles", color="#2563eb", size=18))
+        logo_lbl.setPixmap(get_vector_pixmap("sparkles", color="#18181b", size=18))
         brand_row.addWidget(logo_lbl)
 
-        title_lbl = QLabel("Thought Capture")
-        title_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #0f172a;")
+        title_lbl = QLabel(APP_DISPLAY_NAME)
+        title_lbl.setStyleSheet("font-size: 14px; font-weight: 700; color: #09090b; letter-spacing: -0.2px;")
         brand_row.addWidget(title_lbl)
         brand_row.addStretch()
 
         layout.addLayout(brand_row)
 
-        # Section: FILTERS
+        # Section: CATEGORIES
         sec_views = QLabel("CATEGORIES")
-        sec_views.setStyleSheet("font-size: 10px; font-weight: 700; color: #94a3b8; padding: 6px 8px 2px 8px;")
+        sec_views.setStyleSheet("font-size: 10px; font-weight: 700; color: #a1a1aa; padding: 8px 8px 2px 8px; letter-spacing: 0.5px;")
         layout.addWidget(sec_views)
 
         self.sidebar_items: dict[str, SidebarItem] = {}
         categories_meta = [
-            ("all", "All Thoughts", "inbox", "#3b82f6"),
+            ("all", "All Thoughts", "inbox", "#18181b"),
             ("Task", "Tasks", "check-square", "#2563eb"),
-            ("Bug", "Bugs", "bug", "#e11d48"),
+            ("Bug", "Bugs", "bug", "#dc2626"),
             ("Idea", "Ideas", "lightbulb", "#d97706"),
-            ("Note", "Notes", "file-text", "#64748b"),
+            ("Note", "Notes", "file-text", "#71717a"),
         ]
 
         for key, label, icon_name, color in categories_meta:
@@ -339,14 +507,14 @@ class LibraryWindow(QMainWindow):
         # Separator line
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color: #e2e8f0; margin: 4px 6px;")
+        sep.setStyleSheet("border: none; border-top: 1px solid #e4e4e7; margin: 4px 6px; max-height: 1px;")
         layout.addWidget(sep)
 
         sec_media = QLabel("ATTACHMENTS")
-        sec_media.setStyleSheet("font-size: 10px; font-weight: 700; color: #94a3b8; padding: 2px 8px;")
+        sec_media.setStyleSheet("font-size: 10px; font-weight: 700; color: #a1a1aa; padding: 2px 8px; letter-spacing: 0.5px;")
         layout.addWidget(sec_media)
 
-        item_ss = SidebarItem("screenshot", "Screenshots", "image", "#7c3aed")
+        item_ss = SidebarItem("screenshot", "Screenshots", "image", "#71717a")
         item_ss.mousePressEvent = lambda e: self._on_sidebar_item_clicked("screenshot")
         self.sidebar_items["screenshot"] = item_ss
         layout.addWidget(item_ss)
@@ -355,11 +523,11 @@ class LibraryWindow(QMainWindow):
 
         # Settings Toggle Button in Sidebar Footer
         self.toggle_settings_btn = QPushButton(" Settings")
-        self.toggle_settings_btn.setIcon(get_vector_icon("settings", color="#475569", size=15))
+        self.toggle_settings_btn.setIcon(get_vector_icon("settings", color="#52525b", size=15))
         self.toggle_settings_btn.setStyleSheet(
-            "QPushButton { background: transparent; border: 1px solid #e2e8f0; border-radius: 6px; padding: 7px 10px; font-size: 12px; color: #334155; font-weight: 500; text-align: left; }"
-            "QPushButton:hover { background: #f1f5f9; color: #0f172a; }"
-            "QPushButton:checked { background: #e2e8f0; font-weight: 700; }"
+            "QPushButton { background: #ffffff; border: 1px solid #e4e4e7; border-radius: 8px; padding: 8px 12px; font-size: 12px; color: #27272a; font-weight: 500; text-align: left; }"
+            "QPushButton:hover { background: #e4e4e7; color: #09090b; }"
+            "QPushButton:checked { background: #18181b; color: #ffffff; border-color: #18181b; font-weight: 600; }"
         )
         self.toggle_settings_btn.setCheckable(True)
         self.toggle_settings_btn.toggled.connect(self._on_toggle_settings_bar)
@@ -374,44 +542,38 @@ class LibraryWindow(QMainWindow):
         pane = QWidget()
         pane.setStyleSheet("background: #ffffff;")
         layout = QVBoxLayout(pane)
-        layout.setContentsMargins(10, 10, 10, 8)
+        layout.setContentsMargins(12, 12, 12, 10)
         layout.setSpacing(8)
 
         # Search Bar
-        search_row = QHBoxLayout()
-        search_row.setContentsMargins(0, 0, 0, 0)
-        search_row.setSpacing(6)
-
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search thoughts, applications, tags...")
+        self.search_input.setPlaceholderText("Search thoughts, apps, tags...")
         self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self._on_search_changed)
         self.search_input.setStyleSheet(
-            "QLineEdit { padding: 7px 10px 7px 28px; font-size: 12px; border: 1px solid #cbd5e1; border-radius: 6px; background: #ffffff; }"
-            "QLineEdit:focus { border: 1px solid #2563eb; }"
+            "QLineEdit { padding: 8px 12px; font-size: 12px; border: 1px solid #e4e4e7; border-radius: 8px; background: #fafafa; color: #18181b; }"
+            "QLineEdit:focus { border: 1px solid #18181b; background: #ffffff; }"
         )
-        search_row.addWidget(self.search_input)
-
-        layout.addLayout(search_row)
+        layout.addWidget(self.search_input)
 
         # Active Category Filter Pill
         self.filter_indicator_frame = QFrame()
         self.filter_indicator_frame.setStyleSheet(
-            "QFrame { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 5px; padding: 2px 8px; }"
+            "QFrame { background: #f4f4f5; border: 1px solid #e4e4e7; border-radius: 6px; padding: 2px 8px; }"
         )
         filter_layout = QHBoxLayout(self.filter_indicator_frame)
-        filter_layout.setContentsMargins(4, 2, 4, 2)
+        filter_layout.setContentsMargins(6, 3, 6, 3)
         filter_layout.setSpacing(6)
 
-        self.filter_indicator_label = QLabel("Filtered by: All")
-        self.filter_indicator_label.setStyleSheet("color: #1e40af; font-size: 11px; font-weight: 600;")
+        self.filter_indicator_label = QLabel("Filtered: All")
+        self.filter_indicator_label.setStyleSheet("color: #18181b; font-size: 11px; font-weight: 600;")
         filter_layout.addWidget(self.filter_indicator_label)
         filter_layout.addStretch()
 
-        clear_filter_btn = QPushButton("✕ Clear")
+        clear_filter_btn = QPushButton("✕ Clear filter")
         clear_filter_btn.setStyleSheet(
-            "QPushButton { border: none; background: transparent; color: #3b82f6; font-size: 11px; font-weight: bold; padding: 0 4px; }"
-            "QPushButton:hover { color: #1d4ed8; text-decoration: underline; }"
+            "QPushButton { border: none; background: transparent; color: #71717a; font-size: 11px; font-weight: 500; padding: 0 4px; }"
+            "QPushButton:hover { color: #09090b; }"
         )
         clear_filter_btn.clicked.connect(lambda: self._on_sidebar_item_clicked("all"))
         filter_layout.addWidget(clear_filter_btn)
@@ -422,10 +584,10 @@ class LibraryWindow(QMainWindow):
         # Note List
         self.note_list = QListWidget()
         self.note_list.setStyleSheet(
-            "QListWidget { border: 1px solid #e2e8f0; border-radius: 6px; background: #ffffff; padding: 2px; outline: none; }"
-            "QListWidget::item { border-bottom: 1px solid #f1f5f9; border-radius: 6px; margin: 2px 2px; }"
-            "QListWidget::item:selected { background: #eff6ff; border: 1px solid #bfdbfe; }"
-            "QListWidget::item:hover:!selected { background: #f8fafc; }"
+            "QListWidget { border: 1px solid #e4e4e7; border-radius: 8px; background: #ffffff; padding: 4px; outline: none; }"
+            "QListWidget::item { border-bottom: 1px solid #f4f4f5; border-radius: 6px; margin: 2px 0px; }"
+            "QListWidget::item:selected { background: #f4f4f5; border: 1px solid #e4e4e7; }"
+            "QListWidget::item:hover:!selected { background: #fafafa; }"
         )
         self.note_list.currentRowChanged.connect(self._on_note_selected)
         layout.addWidget(self.note_list)
@@ -434,9 +596,9 @@ class LibraryWindow(QMainWindow):
 
     def _build_detail_pane(self) -> QWidget:
         pane = QWidget()
-        pane.setStyleSheet("background: #f8fafc;")
+        pane.setStyleSheet("background: #fafafa;")
         layout = QVBoxLayout(pane)
-        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(10)
 
         # Top Bar: Editable Category Selector + Actions (Save, Copy, Delete)
@@ -444,22 +606,17 @@ class LibraryWindow(QMainWindow):
         top_bar.setContentsMargins(0, 0, 0, 0)
         top_bar.setSpacing(8)
 
-        # Editable Category Selector
         cat_select_lbl = QLabel("Category:")
-        cat_select_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #64748b;")
+        cat_select_lbl.setStyleSheet("font-size: 11px; font-weight: 600; color: #71717a;")
         top_bar.addWidget(cat_select_lbl)
 
         self.category_combo = QComboBox()
-        self.category_combo.setStyleSheet(
-            "QComboBox { padding: 4px 10px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1; border-radius: 6px; background: #ffffff; min-width: 110px; }"
-            "QComboBox:hover { border: 1px solid #94a3b8; }"
-            "QComboBox::drop-down { border: none; }"
-        )
-        self.category_combo.addItem(get_vector_icon("file-text", color="#64748b"), "Note", "Note")
+        _setup_apple_combobox(self.category_combo)
+        self.category_combo.addItem(get_vector_icon("file-text", color="#71717a"), "Note", "Note")
         self.category_combo.addItem(get_vector_icon("check-square", color="#2563eb"), "Task", "Task")
-        self.category_combo.addItem(get_vector_icon("bug", color="#e11d48"), "Bug", "Bug")
+        self.category_combo.addItem(get_vector_icon("bug", color="#dc2626"), "Bug", "Bug")
         self.category_combo.addItem(get_vector_icon("lightbulb", color="#d97706"), "Idea", "Idea")
-        self.category_combo.addItem(get_vector_icon("tag", color="#94a3b8"), "(None)", "")
+        self.category_combo.addItem(get_vector_icon("tag", color="#a1a1aa"), "(None)", "")
         self.category_combo.currentIndexChanged.connect(self._on_category_dropdown_changed)
         top_bar.addWidget(self.category_combo)
 
@@ -470,19 +627,19 @@ class LibraryWindow(QMainWindow):
         self.save_btn.setIcon(get_vector_icon("save", color="#ffffff", size=13))
         self.save_btn.setEnabled(False)
         self.save_btn.setStyleSheet(
-            "QPushButton { background: #2563eb; color: white; border: none; border-radius: 6px; padding: 5px 12px; font-size: 12px; font-weight: 600; }"
-            "QPushButton:hover { background: #1d4ed8; }"
-            "QPushButton:disabled { background: #cbd5e1; color: #94a3b8; }"
+            "QPushButton { background: #18181b; color: white; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; }"
+            "QPushButton:hover { background: #27272a; }"
+            "QPushButton:disabled { background: #e4e4e7; color: #a1a1aa; }"
         )
         self.save_btn.clicked.connect(self._save_changes)
         top_bar.addWidget(self.save_btn)
 
         # Copy Active Button
         self.copy_main_btn = QPushButton(" Copy")
-        self.copy_main_btn.setIcon(get_vector_icon("copy", color="#334155", size=13))
+        self.copy_main_btn.setIcon(get_vector_icon("copy", color="#27272a", size=13))
         self.copy_main_btn.setStyleSheet(
-            "QPushButton { background: #ffffff; color: #334155; border: 1px solid #cbd5e1; border-radius: 6px; padding: 5px 12px; font-size: 12px; font-weight: 500; }"
-            "QPushButton:hover { background: #f1f5f9; }"
+            "QPushButton { background: #ffffff; color: #27272a; border: 1px solid #e4e4e7; border-radius: 6px; padding: 6px 12px; font-size: 12px; font-weight: 500; }"
+            "QPushButton:hover { background: #f4f4f5; }"
         )
         self.copy_main_btn.clicked.connect(self._copy_current_active_text)
         top_bar.addWidget(self.copy_main_btn)
@@ -491,8 +648,8 @@ class LibraryWindow(QMainWindow):
         self.delete_btn = QPushButton(" Delete")
         self.delete_btn.setIcon(get_vector_icon("trash-2", color="#dc2626", size=13))
         self.delete_btn.setStyleSheet(
-            "QPushButton { background: #fff1f2; color: #e11d48; border: 1px solid #fecdd3; border-radius: 6px; padding: 5px 10px; font-size: 12px; font-weight: 500; }"
-            "QPushButton:hover { background: #ffe4e6; }"
+            "QPushButton { background: #ffffff; color: #dc2626; border: 1px solid #fecdd3; border-radius: 6px; padding: 6px 10px; font-size: 12px; font-weight: 500; }"
+            "QPushButton:hover { background: #fef2f2; }"
         )
         self.delete_btn.clicked.connect(self._delete_current_note)
         top_bar.addWidget(self.delete_btn)
@@ -501,8 +658,9 @@ class LibraryWindow(QMainWindow):
 
         # Context Card (Time, App, Window title, Tags)
         meta_frame = QFrame()
+        meta_frame.setObjectName("metaCard")
         meta_frame.setStyleSheet(
-            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 10px; }"
+            "QFrame#metaCard { background: #ffffff; border: 1px solid #e4e4e7; border-radius: 8px; padding: 8px 10px; }"
         )
         meta_layout = QVBoxLayout(meta_frame)
         meta_layout.setContentsMargins(8, 8, 8, 8)
@@ -511,25 +669,25 @@ class LibraryWindow(QMainWindow):
         meta_row1 = QHBoxLayout()
         meta_row1.setSpacing(6)
         time_ico = QLabel()
-        time_ico.setPixmap(get_vector_pixmap("clock", color="#64748b", size=13))
+        time_ico.setPixmap(get_vector_pixmap("clock", color="#71717a", size=13))
         meta_row1.addWidget(time_ico)
         self.meta_time_label = QLabel("Captured: -")
-        self.meta_time_label.setStyleSheet("font-size: 11px; font-weight: 600; color: #1e293b;")
+        self.meta_time_label.setStyleSheet("font-size: 11px; font-weight: 600; color: #18181b;")
         meta_row1.addWidget(self.meta_time_label)
 
         meta_row1.addSpacing(12)
         app_ico = QLabel()
-        app_ico.setPixmap(get_vector_pixmap("app-window", color="#64748b", size=13))
+        app_ico.setPixmap(get_vector_pixmap("app-window", color="#71717a", size=13))
         meta_row1.addWidget(app_ico)
         self.meta_app_label = QLabel("Application: -")
-        self.meta_app_label.setStyleSheet("font-size: 11px; color: #475569;")
+        self.meta_app_label.setStyleSheet("font-size: 11px; color: #52525b;")
         meta_row1.addWidget(self.meta_app_label)
         meta_row1.addStretch()
         meta_layout.addLayout(meta_row1)
 
         self.meta_window_label = QLabel("Window Title: -")
         self.meta_window_label.setWordWrap(True)
-        self.meta_window_label.setStyleSheet("font-size: 11px; color: #64748b; margin-left: 2px;")
+        self.meta_window_label.setStyleSheet("font-size: 11px; color: #71717a; margin-left: 2px;")
         meta_layout.addWidget(self.meta_window_label)
 
         # Tags and Category labels
@@ -538,16 +696,16 @@ class LibraryWindow(QMainWindow):
         tags_sub_row.setSpacing(8)
 
         tag_ico = QLabel()
-        tag_ico.setPixmap(get_vector_pixmap("tag", color="#6366f1", size=12))
+        tag_ico.setPixmap(get_vector_pixmap("tag", color="#71717a", size=12))
         tags_sub_row.addWidget(tag_ico)
 
         self.meta_tags_label = QLabel("Tags: None")
-        self.meta_tags_label.setStyleSheet("font-size: 11px; color: #6366f1; font-weight: 500;")
+        self.meta_tags_label.setStyleSheet("font-size: 11px; color: #52525b; font-weight: 500;")
         tags_sub_row.addWidget(self.meta_tags_label)
         tags_sub_row.addStretch()
 
         self.meta_category_label = QLabel("Category: Note")
-        self.meta_category_label.setStyleSheet("font-size: 11px; color: #475569; font-weight: 600;")
+        self.meta_category_label.setStyleSheet("font-size: 11px; color: #52525b; font-weight: 600;")
         tags_sub_row.addWidget(self.meta_category_label)
 
         meta_layout.addLayout(tags_sub_row)
@@ -555,8 +713,9 @@ class LibraryWindow(QMainWindow):
 
         # Screenshot Preview Card (if attached)
         self.screenshot_frame = QFrame()
+        self.screenshot_frame.setObjectName("screenshotCard")
         self.screenshot_frame.setStyleSheet(
-            "QFrame { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 6px; }"
+            "QFrame#screenshotCard { background: #ffffff; border: 1px solid #e4e4e7; border-radius: 8px; padding: 6px; }"
         )
         screenshot_layout = QHBoxLayout(self.screenshot_frame)
         screenshot_layout.setContentsMargins(6, 6, 6, 6)
@@ -565,22 +724,22 @@ class LibraryWindow(QMainWindow):
         self.screenshot_thumb = QLabel()
         self.screenshot_thumb.setFixedSize(110, 68)
         self.screenshot_thumb.setScaledContents(True)
-        self.screenshot_thumb.setStyleSheet("border: 1px solid #cbd5e1; border-radius: 4px;")
+        self.screenshot_thumb.setStyleSheet("border: 1px solid #e4e4e7; border-radius: 4px;")
         screenshot_layout.addWidget(self.screenshot_thumb)
 
         screenshot_info_layout = QVBoxLayout()
         screenshot_info_layout.setSpacing(4)
         self.screenshot_title = QLabel("Attached Screenshot")
-        self.screenshot_title.setStyleSheet("font-size: 11px; font-weight: 700; color: #334155;")
+        self.screenshot_title.setStyleSheet("font-size: 11px; font-weight: 600; color: #18181b;")
         screenshot_info_layout.addWidget(self.screenshot_title)
 
         screenshot_actions = QHBoxLayout()
         screenshot_actions.setSpacing(6)
         self.view_screenshot_btn = QPushButton(" Open Image")
-        self.view_screenshot_btn.setIcon(get_vector_icon("external-link", color="#334155", size=12))
+        self.view_screenshot_btn.setIcon(get_vector_icon("external-link", color="#27272a", size=12))
         self.view_screenshot_btn.setStyleSheet(
-            "QPushButton { font-size: 11px; padding: 3px 8px; background: white; border: 1px solid #cbd5e1; border-radius: 4px; }"
-            "QPushButton:hover { background: #f1f5f9; }"
+            "QPushButton { font-size: 11px; padding: 3px 8px; background: white; border: 1px solid #e4e4e7; border-radius: 4px; }"
+            "QPushButton:hover { background: #f4f4f5; }"
         )
         self.view_screenshot_btn.clicked.connect(self._open_screenshot_file)
         screenshot_actions.addWidget(self.view_screenshot_btn)
@@ -588,8 +747,8 @@ class LibraryWindow(QMainWindow):
         self.delete_screenshot_btn = QPushButton(" Remove")
         self.delete_screenshot_btn.setIcon(get_vector_icon("x", color="#dc2626", size=12))
         self.delete_screenshot_btn.setStyleSheet(
-            "QPushButton { font-size: 11px; padding: 3px 8px; color: #dc2626; background: #fff1f2; border: 1px solid #fecdd3; border-radius: 4px; }"
-            "QPushButton:hover { background: #ffe4e6; }"
+            "QPushButton { font-size: 11px; padding: 3px 8px; color: #dc2626; background: #ffffff; border: 1px solid #fecdd3; border-radius: 4px; }"
+            "QPushButton:hover { background: #fef2f2; }"
         )
         self.delete_screenshot_btn.clicked.connect(self._remove_screenshot_from_note)
         screenshot_actions.addWidget(self.delete_screenshot_btn)
@@ -602,234 +761,626 @@ class LibraryWindow(QMainWindow):
         self.screenshot_frame.setVisible(False)
         layout.addWidget(self.screenshot_frame)
 
-        # Tabbed Text View: Original vs Refined
-        self.text_tabs = QTabWidget()
-        self.text_tabs.setStyleSheet(
-            "QTabWidget::pane { border: 1px solid #e2e8f0; border-radius: 6px; background: white; }"
-            "QTabBar::tab { padding: 6px 16px; font-size: 12px; font-weight: 500; border-top-left-radius: 6px; border-top-right-radius: 6px; color: #64748b; background: #f1f5f9; margin-right: 4px; }"
-            "QTabBar::tab:selected { background: white; color: #2563eb; font-weight: 700; border: 1px solid #e2e8f0; border-bottom: none; }"
+        # Single Clean Transcript Card
+        transcript_frame = QFrame()
+        transcript_frame.setObjectName("transcriptCard")
+        transcript_frame.setStyleSheet(
+            "QFrame#transcriptCard { background: #ffffff; border: 1px solid #e4e4e7; border-radius: 8px; padding: 10px; }"
         )
+        t_layout = QVBoxLayout(transcript_frame)
+        t_layout.setContentsMargins(10, 10, 10, 10)
+        t_layout.setSpacing(6)
 
-        # Tab 1: Original Transcript
-        tab1_widget = QWidget()
-        tab1_layout = QVBoxLayout(tab1_widget)
-        tab1_layout.setContentsMargins(8, 8, 8, 8)
-        tab1_layout.setSpacing(6)
+        t_header = QHBoxLayout()
+        t_title = QLabel("TRANSCRIPT")
+        t_title.setStyleSheet("font-size: 11px; font-weight: 700; color: #71717a; letter-spacing: 0.5px;")
+        t_header.addWidget(t_title)
 
-        tab1_header = QHBoxLayout()
         self.edited_badge = QLabel("Edited manually")
         self.edited_badge.setStyleSheet(
-            "background: #fef3c7; color: #92400e; border-radius: 3px; padding: 1px 6px; font-size: 10px; font-weight: 600;"
+            "background: #f4f4f5; color: #71717a; border-radius: 3px; padding: 1px 6px; font-size: 10px; font-weight: 600;"
         )
         self.edited_badge.setVisible(False)
-        tab1_header.addWidget(self.edited_badge)
-        tab1_header.addStretch()
+        t_header.addWidget(self.edited_badge)
+        t_header.addStretch()
 
-        self.copy_original_btn = QPushButton(" Copy Original")
-        self.copy_original_btn.setIcon(get_vector_icon("copy", color="#475569", size=12))
-        self.copy_original_btn.setStyleSheet(
-            "QPushButton { padding: 3px 8px; font-size: 11px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 4px; }"
-            "QPushButton:hover { background: #f1f5f9; }"
+        self.copy_transcript_btn = QPushButton(" Copy Text")
+        self.copy_transcript_btn.setIcon(get_vector_icon("copy", color="#52525b", size=12))
+        self.copy_transcript_btn.setStyleSheet(
+            "QPushButton { padding: 3px 8px; font-size: 11px; background: #fafafa; border: 1px solid #e4e4e7; border-radius: 4px; }"
+            "QPushButton:hover { background: #f4f4f5; }"
         )
-        self.copy_original_btn.clicked.connect(self._copy_original_transcript)
-        tab1_header.addWidget(self.copy_original_btn)
-        tab1_layout.addLayout(tab1_header)
+        self.copy_transcript_btn.clicked.connect(self._copy_original_transcript)
+        t_header.addWidget(self.copy_transcript_btn)
+        t_layout.addLayout(t_header)
 
         self.transcript_edit = QPlainTextEdit()
         self.transcript_edit.setStyleSheet(
-            "QPlainTextEdit { border: none; font-size: 13px; line-height: 1.45; color: #0f172a; background: transparent; padding: 4px; }"
+            "QPlainTextEdit { border: none; font-size: 13px; line-height: 1.5; color: #18181b; background: transparent; padding: 4px; }"
         )
         self.transcript_edit.textChanged.connect(self._on_text_modified)
-        tab1_layout.addWidget(self.transcript_edit)
+        t_layout.addWidget(self.transcript_edit)
 
         self.original_box = QLabel()
         self.original_box.setWordWrap(True)
         self.original_box.setStyleSheet(
-            "background: #f8fafc; color: #64748b; border: 1px dashed #cbd5e1; border-radius: 4px; padding: 6px; font-size: 11px;"
+            "background: #fafafa; color: #71717a; border: 1px dashed #e4e4e7; border-radius: 4px; padding: 6px; font-size: 11px;"
         )
         self.original_box.setVisible(False)
-        tab1_layout.addWidget(self.original_box)
+        t_layout.addWidget(self.original_box)
 
-        self.text_tabs.addTab(tab1_widget, "Original Transcript")
-
-        # Tab 2: Refined Text
-        tab2_widget = QWidget()
-        tab2_layout = QVBoxLayout(tab2_widget)
-        tab2_layout.setContentsMargins(8, 8, 8, 8)
-        tab2_layout.setSpacing(6)
-
-        tab2_header = QHBoxLayout()
-        self.processed_by_label = QLabel("Method: None")
-        self.processed_by_label.setStyleSheet("color: #64748b; font-size: 11px;")
-        tab2_header.addWidget(self.processed_by_label)
-        tab2_header.addStretch()
-
-        self.refine_btn = QPushButton(" Refine with AI")
-        self.refine_btn.setIcon(get_vector_icon("sparkles", color="#166534", size=13))
-        self.refine_btn.setStyleSheet(
-            "QPushButton { padding: 3px 9px; font-size: 11px; font-weight: 600; background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; border-radius: 4px; }"
-            "QPushButton:hover { background: #dcfce7; }"
-        )
-        self.refine_btn.clicked.connect(self._run_text_refinement)
-        tab2_header.addWidget(self.refine_btn)
-
-        self.copy_processed_btn = QPushButton(" Copy Refined")
-        self.copy_processed_btn.setIcon(get_vector_icon("copy", color="#475569", size=12))
-        self.copy_processed_btn.setStyleSheet(
-            "QPushButton { padding: 3px 8px; font-size: 11px; background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 4px; }"
-            "QPushButton:hover { background: #f1f5f9; }"
-        )
-        self.copy_processed_btn.clicked.connect(self._copy_processed_text)
-        tab2_header.addWidget(self.copy_processed_btn)
-        tab2_layout.addLayout(tab2_header)
-
-        self.processed_edit = QPlainTextEdit()
-        self.processed_edit.setStyleSheet(
-            "QPlainTextEdit { border: none; font-size: 13px; line-height: 1.45; color: #0f172a; background: transparent; padding: 4px; }"
-        )
-        self.processed_edit.textChanged.connect(self._on_processed_text_modified)
-        tab2_layout.addWidget(self.processed_edit)
-
-        self.text_tabs.addTab(tab2_widget, "Refined Text")
-        layout.addWidget(self.text_tabs)
+        layout.addWidget(transcript_frame)
 
         return pane
 
-    def _build_settings_panel(self) -> None:
-        self.settings_panel = QFrame()
-        self.settings_panel.setStyleSheet(
-            "QFrame { background: #ffffff; border-bottom: 1px solid #e2e8f0; padding: 10px 16px; }"
-        )
-        settings_layout = QVBoxLayout(self.settings_panel)
-        settings_layout.setContentsMargins(12, 10, 12, 10)
-        settings_layout.setSpacing(8)
+    def _build_settings_view(self) -> QWidget:
+        """Build Apple / ChatGPT style dedicated Settings view with grouped cards."""
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("QScrollArea { border: none; background: #fafafa; }")
 
-        # Title row
+        container = QWidget()
+        container.setStyleSheet("background: #fafafa;")
+        scroll_area.setWidget(container)
+
+        main_vbox = QVBoxLayout(container)
+        main_vbox.setContentsMargins(32, 28, 32, 32)
+        main_vbox.setSpacing(24)
+
+        # Header Title & Subtitle
+        header_vbox = QVBoxLayout()
+        header_vbox.setSpacing(4)
+
         title_row = QHBoxLayout()
-        title_lbl = QLabel("Application Settings")
-        title_lbl.setStyleSheet("font-size: 13px; font-weight: 700; color: #0f172a;")
+        title_lbl = QLabel("Settings")
+        title_lbl.setStyleSheet("font-size: 22px; font-weight: 700; color: #09090b; letter-spacing: -0.4px;")
         title_row.addWidget(title_lbl)
         title_row.addStretch()
 
-        close_btn = QPushButton("✕ Close Settings")
-        close_btn.setStyleSheet(
-            "QPushButton { border: none; background: transparent; color: #64748b; font-size: 11px; font-weight: bold; }"
-            "QPushButton:hover { color: #0f172a; }"
+        back_btn = QPushButton("✕ Close")
+        back_btn.setStyleSheet(
+            "QPushButton { border: 1px solid #e4e4e7; background: #ffffff; border-radius: 6px; padding: 5px 12px; font-size: 12px; font-weight: 500; color: #52525b; }"
+            "QPushButton:hover { background: #f4f4f5; color: #09090b; }"
         )
-        close_btn.clicked.connect(lambda: self._on_toggle_settings_bar(False))
-        title_row.addWidget(close_btn)
-        settings_layout.addLayout(title_row)
+        back_btn.clicked.connect(lambda: self._on_toggle_settings_bar(False))
+        title_row.addWidget(back_btn)
+        header_vbox.addLayout(title_row)
 
-        row1 = QHBoxLayout()
-        row1.setSpacing(20)
-        self.overlay_cb = QCheckBox("Show Floating Recording Overlay")
+        desc_lbl = QLabel("Manage recording behavior, audio streaming, Whisper transcription, and AI models.")
+        desc_lbl.setStyleSheet("font-size: 13px; color: #71717a;")
+        header_vbox.addWidget(desc_lbl)
+        main_vbox.addLayout(header_vbox)
+
+        # Section 1: GENERAL
+        sec_gen_lbl = QLabel("GENERAL")
+        sec_gen_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #a1a1aa; letter-spacing: 0.5px;")
+        main_vbox.addWidget(sec_gen_lbl)
+
+        card_gen = self._create_settings_card()
+        cg_layout = QVBoxLayout(card_gen)
+        cg_layout.setContentsMargins(16, 6, 16, 6)
+        cg_layout.setSpacing(0)
+
+        # Row 1: Overlay Switch
+        self.overlay_cb = ToggleSwitch()
         self.overlay_cb.setChecked(self.settings.overlay_visible)
         self.overlay_cb.toggled.connect(self._on_overlay_cb_toggled)
-        row1.addWidget(self.overlay_cb)
+        cg_layout.addWidget(
+            self._create_setting_row(
+                "Floating Recording Overlay",
+                "Displays a minimalist status bar on the screen edge while recording.",
+                self.overlay_cb,
+            )
+        )
+        cg_layout.addWidget(self._create_card_divider())
 
-        self.notifications_cb = QCheckBox("Show Windows Notification Popups")
+        # Row 2: Windows Notifications
+        self.notifications_cb = ToggleSwitch()
         self.notifications_cb.setChecked(self.settings.show_notifications)
         self.notifications_cb.toggled.connect(self._on_notifications_cb_toggled)
-        row1.addWidget(self.notifications_cb)
+        cg_layout.addWidget(
+            self._create_setting_row(
+                "Windows Notifications",
+                "Show a discreet notification popup upon successful transcription.",
+                self.notifications_cb,
+            )
+        )
+        cg_layout.addWidget(self._create_card_divider())
 
-        self.auto_copy_cb = QCheckBox("Auto-copy to clipboard on capture")
+        # Row 3: Auto-copy
+        self.auto_copy_cb = ToggleSwitch()
         self.auto_copy_cb.setChecked(self.settings.auto_copy_clipboard)
         self.auto_copy_cb.toggled.connect(self._on_auto_copy_toggled)
-        row1.addWidget(self.auto_copy_cb)
-        row1.addStretch()
-        settings_layout.addLayout(row1)
+        cg_layout.addWidget(
+            self._create_setting_row(
+                "Auto-copy to Clipboard",
+                "Copies transcribed thoughts directly to clipboard immediately after capture.",
+                self.auto_copy_cb,
+            )
+        )
 
-        row2 = QHBoxLayout()
-        row2.setSpacing(16)
+        main_vbox.addWidget(card_gen)
 
-        ver_lbl = QLabel("Default Text Version:")
-        ver_lbl.setStyleSheet("color: #475569; font-size: 12px; font-weight: 500;")
-        row2.addWidget(ver_lbl)
-        self.version_combo = QComboBox()
-        self.version_combo.addItem("Original Transcript", "original")
-        self.version_combo.addItem("Processed Text", "processed")
-        if self.settings.default_text_version == "processed":
-            self.version_combo.setCurrentIndex(1)
-        self.version_combo.currentIndexChanged.connect(self._on_version_combo_changed)
-        row2.addWidget(self.version_combo)
+        # Section 2: SPEECH RECOGNITION & WHISPER
+        sec_whisp_lbl = QLabel("SPEECH RECOGNITION & WHISPER")
+        sec_whisp_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #a1a1aa; letter-spacing: 0.5px;")
+        main_vbox.addWidget(sec_whisp_lbl)
 
-        model_lbl = QLabel("Whisper Model:")
-        model_lbl.setStyleSheet("color: #475569; font-size: 12px; font-weight: 500;")
-        row2.addWidget(model_lbl)
-        self.model_combo = QComboBox()
-        for label, val in [
-            ("small (Empfohlen: ~0.8s, beste Balance auf CPU — 460MB)", "small"),
-            ("base (Blitzschnell: ~0.3s, geringere Genauigkeit — 74MB)", "base"),
-            ("medium (~4-6s auf CPU, sehr hohe Genauigkeit — 1.5GB)", "medium"),
-            ("large-v3-turbo (Rechenintensiv: ~15-20s auf CPU — 1.6GB)", "large-v3-turbo"),
-        ]:
-            self.model_combo.addItem(label, val)
-        idx = self.model_combo.findData(self.settings.whisper_model or "small")
-        if idx >= 0:
-            self.model_combo.setCurrentIndex(idx)
-        self.model_combo.currentIndexChanged.connect(self._on_model_combo_changed)
-        row2.addWidget(self.model_combo)
+        card_whisp = self._create_settings_card()
+        cw_layout = QVBoxLayout(card_whisp)
+        cw_layout.setContentsMargins(16, 6, 16, 6)
+        cw_layout.setSpacing(0)
 
-        lang_lbl = QLabel("Sprache:")
-        lang_lbl.setStyleSheet("color: #475569; font-size: 12px; font-weight: 500;")
-        row2.addWidget(lang_lbl)
+        # Live-Streaming Toggle
+        self.streaming_cb = ToggleSwitch()
+        self.streaming_cb.setChecked(self.settings.streaming_transcription)
+        self.streaming_cb.toggled.connect(self._on_streaming_cb_toggled)
+        cw_layout.addWidget(
+            self._create_setting_row(
+                "Live-Streaming Transcription",
+                "Transcribes chunks in background while speaking for near-instant results when you finish.",
+                self.streaming_cb,
+            )
+        )
+        cw_layout.addWidget(self._create_card_divider())
+
+        # Language combo
         self.lang_combo = QComboBox()
+        _setup_apple_combobox(self.lang_combo)
         for label, val in [
-            ("Deutsch (Empfohlen für Denglisch)", "de"),
+            ("German (Recommended for German & Denglish)", "de"),
             ("English", "en"),
-            ("Automatisch erkennen (Auto)", "auto"),
+            ("Auto-detect", "auto"),
         ]:
             self.lang_combo.addItem(label, val)
         l_idx = self.lang_combo.findData(self.settings.whisper_language or "de")
         if l_idx >= 0:
             self.lang_combo.setCurrentIndex(l_idx)
         self.lang_combo.currentIndexChanged.connect(self._on_lang_combo_changed)
-        row2.addWidget(self.lang_combo)
 
-        row2.addStretch()
-        settings_layout.addLayout(row2)
+        cw_layout.addWidget(
+            self._create_setting_row(
+                "Spoken Language",
+                "Select language or allow automatic detection.",
+                self.lang_combo,
+            )
+        )
+        cw_layout.addWidget(self._create_card_divider())
 
-        # Row 3: Refinement Engine & LLM Model
-        row3 = QHBoxLayout()
-        row3.setSpacing(16)
+        # Active Whisper Model Dropdown
+        self.model_combo = QComboBox()
+        _setup_apple_combobox(self.model_combo)
+        self._refresh_model_combo_items()
+        self.model_combo.currentIndexChanged.connect(self._on_model_combo_changed)
 
-        engine_lbl = QLabel("Text-Aufbereitung:")
-        engine_lbl.setStyleSheet("color: #475569; font-size: 12px; font-weight: 500;")
-        row3.addWidget(engine_lbl)
+        cw_layout.addWidget(
+            self._create_setting_row(
+                "Active Whisper Model",
+                "Select which model is currently used for all speech transcriptions.",
+                self.model_combo,
+            )
+        )
+
+        main_vbox.addWidget(card_whisp)
+
+        # Dedicated Model Status Frame (Progress bar & ready/error badge)
+        self.model_status_frame = QFrame()
+        self.model_status_frame.setObjectName("statusFrame")
+        self.model_status_frame.setStyleSheet(
+            "QFrame#statusFrame { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 8px 14px; }"
+        )
+        status_layout = QHBoxLayout(self.model_status_frame)
+        status_layout.setContentsMargins(8, 4, 8, 4)
+        status_layout.setSpacing(10)
+
+        self.model_status_icon = QLabel()
+        self.model_status_icon.setPixmap(get_vector_pixmap("check-circle", color="#16a34a", size=15))
+        status_layout.addWidget(self.model_status_icon)
+
+        self.model_status_label = QLabel(f"Model '{self.settings.whisper_model or 'small'}' active and ready.")
+        self.model_status_label.setStyleSheet("color: #15803d; font-size: 12px; font-weight: 600;")
+        status_layout.addWidget(self.model_status_label)
+
+        self.model_progress = QProgressBar()
+        self.model_progress.setRange(0, 0)
+        self.model_progress.setFixedHeight(4)
+        self.model_progress.setFixedWidth(140)
+        self.model_progress.setTextVisible(False)
+        self.model_progress.setStyleSheet(
+            "QProgressBar { border: none; border-radius: 2px; background: #e4e4e7; }"
+            "QProgressBar::chunk { background: #18181b; border-radius: 2px; }"
+        )
+        self.model_progress.setVisible(False)
+        status_layout.addWidget(self.model_progress)
+        status_layout.addStretch()
+
+        main_vbox.addWidget(self.model_status_frame)
+
+        # Section 3: WHISPER MODELS & STORAGE
+        sec_storage_lbl = QLabel("WHISPER MODELS & STORAGE")
+        sec_storage_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #a1a1aa; letter-spacing: 0.5px;")
+        main_vbox.addWidget(sec_storage_lbl)
+
+        self.whisper_models_card = self._create_settings_card()
+        self.whisper_models_layout = QVBoxLayout(self.whisper_models_card)
+        self.whisper_models_layout.setContentsMargins(16, 6, 16, 6)
+        self.whisper_models_layout.setSpacing(0)
+        self._refresh_whisper_models_card()
+        main_vbox.addWidget(self.whisper_models_card)
+
+        # Section 4: AI CATEGORIZATION & LLM
+        sec_llm_lbl = QLabel("AI CATEGORIZATION & LLM")
+        sec_llm_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #a1a1aa; letter-spacing: 0.5px;")
+        main_vbox.addWidget(sec_llm_lbl)
+
+        card_llm = self._create_settings_card()
+        cl_layout = QVBoxLayout(card_llm)
+        cl_layout.setContentsMargins(16, 6, 16, 6)
+        cl_layout.setSpacing(0)
+
+        # Engine Combo
         self.engine_combo = QComboBox()
+        _setup_apple_combobox(self.engine_combo)
         for label, val in [
-            ("Lokale KI (LLM — Grammatik, Kontext & Auto-Tags)", "llm"),
-            ("Regelbasiert (Schnell, einfache Bereinigung)", "rules"),
+            ("Local LLM (Auto-categorization & Tags)", "llm"),
+            ("Rule-based (Heuristics)", "rules"),
         ]:
             self.engine_combo.addItem(label, val)
         e_idx = self.engine_combo.findData(self.settings.refinement_engine or "llm")
         if e_idx >= 0:
             self.engine_combo.setCurrentIndex(e_idx)
         self.engine_combo.currentIndexChanged.connect(self._on_engine_combo_changed)
-        row3.addWidget(self.engine_combo)
 
-        llm_lbl = QLabel("LLM Modell:")
-        llm_lbl.setStyleSheet("color: #475569; font-size: 12px; font-weight: 500;")
-        row3.addWidget(llm_lbl)
+        cl_layout.addWidget(
+            self._create_setting_row(
+                "Categorization Method",
+                "Determines how thoughts, tasks, and bugs are automatically categorized.",
+                self.engine_combo,
+            )
+        )
+        cl_layout.addWidget(self._create_card_divider())
+
+        # LLM Model Combo
         self.llm_model_combo = QComboBox()
-        for label, val in [
-            ("Qwen 2.5 0.5B (~2-3s, schnell & leicht)", "qwen2.5-0.5b"),
-            ("Qwen 2.5 1.5B (~8-9s, präzise Formulierungen)", "qwen2.5-1.5b"),
-        ]:
-            self.llm_model_combo.addItem(label, val)
-        m_idx = self.llm_model_combo.findData(self.settings.llm_model or "qwen2.5-0.5b")
-        if m_idx >= 0:
-            self.llm_model_combo.setCurrentIndex(m_idx)
+        _setup_apple_combobox(self.llm_model_combo)
+        self._refresh_llm_combo_items()
         self.llm_model_combo.currentIndexChanged.connect(self._on_llm_model_combo_changed)
-        row3.addWidget(self.llm_model_combo)
 
-        row3.addStretch()
-        settings_layout.addLayout(row3)
+        cl_layout.addWidget(
+            self._create_setting_row(
+                "Active LLM Model",
+                "Choose between Qwen 2.5 0.5B (instant) and 1.5B (higher precision).",
+                self.llm_model_combo,
+            )
+        )
 
-        self.settings_panel.setVisible(False)
+        main_vbox.addWidget(card_llm)
+
+        # Section 5: LLM MODELS & STORAGE
+        sec_llm_store_lbl = QLabel("LLM MODELS & STORAGE")
+        sec_llm_store_lbl.setStyleSheet("font-size: 11px; font-weight: 700; color: #a1a1aa; letter-spacing: 0.5px;")
+        main_vbox.addWidget(sec_llm_store_lbl)
+
+        self.llm_models_card = self._create_settings_card()
+        self.llm_models_layout = QVBoxLayout(self.llm_models_card)
+        self.llm_models_layout.setContentsMargins(16, 6, 16, 6)
+        self.llm_models_layout.setSpacing(0)
+        self._refresh_llm_models_card()
+        main_vbox.addWidget(self.llm_models_card)
+
+        # Section 6: ABOUT TUCKNOTE
+        sec_about = QLabel(f"{APP_DISPLAY_NAME} v0.2.0 · 100% local & offline on your computer.")
+        sec_about.setStyleSheet("font-size: 11px; color: #a1a1aa; text-align: center; padding: 12px 4px;")
+        sec_about.setAlignment(Qt.AlignCenter)
+        main_vbox.addWidget(sec_about)
+
+        main_vbox.addStretch()
+
+        return scroll_area
+
+    def _create_settings_card(self) -> QFrame:
+        card = QFrame()
+        card.setObjectName("settingsCard")
+        return card
+
+    def _create_card_divider(self) -> QFrame:
+        div = QFrame()
+        div.setFrameShape(QFrame.HLine)
+        div.setFrameShadow(QFrame.Plain)
+        div.setStyleSheet("border: none; border-top: 1px solid #f4f4f5; max-height: 1px; margin: 0px;")
+        return div
+
+    def _create_setting_row(self, title: str, subtitle: str, control_widget: QWidget) -> QWidget:
+        row = QWidget()
+        row.setStyleSheet("border: none; background: transparent;")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 10, 0, 10)
+        layout.setSpacing(16)
+
+        text_vbox = QVBoxLayout()
+        text_vbox.setSpacing(2)
+
+        t_lbl = QLabel(title)
+        t_lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #09090b;")
+        text_vbox.addWidget(t_lbl)
+
+        s_lbl = QLabel(subtitle)
+        s_lbl.setStyleSheet("font-size: 12px; color: #71717a;")
+        s_lbl.setWordWrap(True)
+        text_vbox.addWidget(s_lbl)
+
+        layout.addLayout(text_vbox, 1)
+        layout.addWidget(control_widget, 0, Qt.AlignRight | Qt.AlignVCenter)
+        return row
+
+    def _refresh_whisper_models_card(self) -> None:
+        """Populate Whisper model items with size, status badge, activation, and deletion buttons."""
+        while self.whisper_models_layout.count():
+            item = self.whisper_models_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        models = [
+            ("small", "Whisper Small (Recommended)", "Optimal balance of speed and accuracy on CPU (~460 MB)"),
+            ("base", "Whisper Base (Fast)", "Ultra fast (~0.3s), minimal resource usage (~74 MB)"),
+            ("medium", "Whisper Medium (Accurate)", "High precision, requires more CPU power (~1.5 GB)"),
+            ("large-v3-turbo", "Whisper Large v3 Turbo", "Maximum accuracy for complex speech and accents (~1.6 GB)"),
+        ]
+
+        active_model = self.settings.whisper_model or "small"
+
+        for idx, (m_val, m_name, m_desc) in enumerate(models):
+            is_active = (m_val == active_model)
+            is_cached = is_whisper_model_cached(m_val)
+            size_mb = get_whisper_model_size_mb(m_val)
+
+            row = QWidget()
+            row.setStyleSheet("border: none; background: transparent;")
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(0, 10, 0, 10)
+            layout.setSpacing(14)
+
+            # Left: Details
+            info_vbox = QVBoxLayout()
+            info_vbox.setSpacing(3)
+
+            title_row = QHBoxLayout()
+            title_row.setSpacing(8)
+
+            t_lbl = QLabel(m_name)
+            t_lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #09090b;")
+            title_row.addWidget(t_lbl)
+
+            # Badges
+            if is_active:
+                badge = QLabel("Active")
+                badge.setStyleSheet(
+                    "background: #18181b; color: #ffffff; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 700;"
+                )
+                title_row.addWidget(badge)
+            elif is_cached:
+                badge = QLabel("Installed")
+                badge.setStyleSheet(
+                    "background: #f4f4f5; color: #52525b; border: 1px solid #e4e4e7; border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 600;"
+                )
+                title_row.addWidget(badge)
+            else:
+                badge = QLabel("Not downloaded")
+                badge.setStyleSheet(
+                    "background: transparent; color: #a1a1aa; border: 1px solid #e4e4e7; border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 500;"
+                )
+                title_row.addWidget(badge)
+
+            if is_cached and size_mb > 0:
+                size_lbl = QLabel(f"{size_mb:.0f} MB")
+                size_lbl.setStyleSheet("font-size: 11px; color: #71717a; font-weight: 500;")
+                title_row.addWidget(size_lbl)
+
+            title_row.addStretch()
+            info_vbox.addLayout(title_row)
+
+            d_lbl = QLabel(m_desc)
+            d_lbl.setStyleSheet("font-size: 11px; color: #71717a;")
+            info_vbox.addWidget(d_lbl)
+            layout.addLayout(info_vbox, 1)
+
+            # Right: Actions
+            actions_row = QHBoxLayout()
+            actions_row.setSpacing(6)
+
+            if not is_active:
+                activate_btn = QPushButton("Activate")
+                activate_btn.setStyleSheet(
+                    "QPushButton { background: #ffffff; border: 1px solid #e4e4e7; border-radius: 6px; padding: 5px 12px; font-size: 11px; font-weight: 600; color: #18181b; }"
+                    "QPushButton:hover { background: #f4f4f5; }"
+                )
+                activate_btn.clicked.connect(lambda _, m=m_val: self._activate_whisper_model(m))
+                actions_row.addWidget(activate_btn)
+
+            if is_cached:
+                del_btn = QPushButton("Delete")
+                del_btn.setIcon(get_vector_icon("trash-2", color="#dc2626", size=12))
+                del_btn.setStyleSheet(
+                    "QPushButton { background: #ffffff; border: 1px solid #fecdd3; border-radius: 6px; padding: 5px 10px; font-size: 11px; font-weight: 500; color: #dc2626; }"
+                    "QPushButton:hover { background: #fef2f2; }"
+                )
+                del_btn.clicked.connect(lambda _, m=m_val: self._on_delete_whisper_model(m))
+                actions_row.addWidget(del_btn)
+
+            layout.addLayout(actions_row)
+            self.whisper_models_layout.addWidget(row)
+
+            if idx < len(models) - 1:
+                self.whisper_models_layout.addWidget(self._create_card_divider())
+
+    def _refresh_llm_models_card(self) -> None:
+        """Populate LLM model items with size, status, activation, and deletion buttons."""
+        while self.llm_models_layout.count():
+            item = self.llm_models_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        models = [
+            ("qwen2.5-0.5b", "Qwen 2.5 0.5B Instruct", "Minimal RAM usage, instant classification (~0.3s, ~390 MB)"),
+            ("qwen2.5-1.5b", "Qwen 2.5 1.5B Instruct", "Higher precision for complex thoughts & tags (~1s, ~980 MB)"),
+        ]
+
+        active_model = self.settings.llm_model or "qwen2.5-0.5b"
+
+        for idx, (m_val, m_name, m_desc) in enumerate(models):
+            is_active = (m_val == active_model)
+            is_cached = is_llm_model_cached(m_val)
+            size_mb = get_llm_model_size_mb(m_val)
+
+            row = QWidget()
+            row.setStyleSheet("border: none; background: transparent;")
+            layout = QHBoxLayout(row)
+            layout.setContentsMargins(0, 10, 0, 10)
+            layout.setSpacing(14)
+
+            info_vbox = QVBoxLayout()
+            info_vbox.setSpacing(3)
+
+            title_row = QHBoxLayout()
+            title_row.setSpacing(8)
+
+            t_lbl = QLabel(m_name)
+            t_lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #09090b;")
+            title_row.addWidget(t_lbl)
+
+            if is_active:
+                badge = QLabel("Active")
+                badge.setStyleSheet(
+                    "background: #18181b; color: #ffffff; border-radius: 4px; padding: 2px 7px; font-size: 10px; font-weight: 700;"
+                )
+                title_row.addWidget(badge)
+            elif is_cached:
+                badge = QLabel("Installed")
+                badge.setStyleSheet(
+                    "background: #f4f4f5; color: #52525b; border: 1px solid #e4e4e7; border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 600;"
+                )
+                title_row.addWidget(badge)
+            else:
+                badge = QLabel("Not downloaded")
+                badge.setStyleSheet(
+                    "background: transparent; color: #a1a1aa; border: 1px solid #e4e4e7; border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 500;"
+                )
+                title_row.addWidget(badge)
+
+            if is_cached and size_mb > 0:
+                size_lbl = QLabel(f"{size_mb:.0f} MB")
+                size_lbl.setStyleSheet("font-size: 11px; color: #71717a; font-weight: 500;")
+                title_row.addWidget(size_lbl)
+
+            title_row.addStretch()
+            info_vbox.addLayout(title_row)
+
+            d_lbl = QLabel(m_desc)
+            d_lbl.setStyleSheet("font-size: 11px; color: #71717a;")
+            info_vbox.addWidget(d_lbl)
+            layout.addLayout(info_vbox, 1)
+
+            actions_row = QHBoxLayout()
+            actions_row.setSpacing(6)
+
+            if not is_active:
+                activate_btn = QPushButton("Activate")
+                activate_btn.setStyleSheet(
+                    "QPushButton { background: #ffffff; border: 1px solid #e4e4e7; border-radius: 6px; padding: 5px 12px; font-size: 11px; font-weight: 600; color: #18181b; }"
+                    "QPushButton:hover { background: #f4f4f5; }"
+                )
+                activate_btn.clicked.connect(lambda _, m=m_val: self._activate_llm_model(m))
+                actions_row.addWidget(activate_btn)
+
+            if is_cached:
+                del_btn = QPushButton("Delete")
+                del_btn.setIcon(get_vector_icon("trash-2", color="#dc2626", size=12))
+                del_btn.setStyleSheet(
+                    "QPushButton { background: #ffffff; border: 1px solid #fecdd3; border-radius: 6px; padding: 5px 10px; font-size: 11px; font-weight: 500; color: #dc2626; }"
+                    "QPushButton:hover { background: #fef2f2; }"
+                )
+                del_btn.clicked.connect(lambda _, m=m_val: self._on_delete_llm_model(m))
+                actions_row.addWidget(del_btn)
+
+            layout.addLayout(actions_row)
+            self.llm_models_layout.addWidget(row)
+
+            if idx < len(models) - 1:
+                self.llm_models_layout.addWidget(self._create_card_divider())
+
+    def _activate_whisper_model(self, model_name: str) -> None:
+        idx = self.model_combo.findData(model_name)
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        else:
+            self.settings.whisper_model = model_name
+            self.settings.save()
+            self.whisper_model_changed.emit(model_name)
+            self._refresh_model_combo_items()
+            self._refresh_whisper_models_card()
+
+    def _activate_llm_model(self, model_key: str) -> None:
+        idx = self.llm_model_combo.findData(model_key)
+        if idx >= 0:
+            self.llm_model_combo.setCurrentIndex(idx)
+        else:
+            self.settings.llm_model = model_key
+            self.settings.save()
+            self.llm_model_changed.emit(model_key)
+            self._refresh_llm_combo_items()
+            self._refresh_llm_models_card()
+
+    def _on_delete_whisper_model(self, model_name: str) -> None:
+        size_mb = get_whisper_model_size_mb(model_name)
+        confirm = QMessageBox.question(
+            self,
+            "Delete Whisper Model",
+            f"Are you sure you want to delete the Whisper model '{model_name}' ({size_mb:.0f} MB)?\n"
+            "It will be removed from disk and can be re-downloaded at any time.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm == QMessageBox.Yes:
+            success = delete_whisper_model(model_name)
+            if success:
+                # If deleted model was active, fallback to small or base
+                if self.settings.whisper_model == model_name:
+                    fallback = "base" if model_name != "base" else "small"
+                    self._activate_whisper_model(fallback)
+                self._refresh_model_combo_items()
+                self._refresh_whisper_models_card()
+                self.status_bar.showMessage(f"Model '{model_name}' deleted. {size_mb:.0f} MB freed.", 3500)
+            else:
+                QMessageBox.warning(self, "Error", f"Could not delete model '{model_name}'.")
+
+    def _on_delete_llm_model(self, model_key: str) -> None:
+        size_mb = get_llm_model_size_mb(model_key)
+        confirm = QMessageBox.question(
+            self,
+            "Delete LLM Model",
+            f"Are you sure you want to delete the LLM model '{model_key}' ({size_mb:.0f} MB) from disk?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm == QMessageBox.Yes:
+            success = delete_llm_model(model_key)
+            if success:
+                if self.settings.llm_model == model_key:
+                    fallback = "qwen2.5-0.5b" if model_key != "qwen2.5-0.5b" else "qwen2.5-1.5b"
+                    self._activate_llm_model(fallback)
+                self._refresh_llm_combo_items()
+                self._refresh_llm_models_card()
+                self.status_bar.showMessage(f"LLM model '{model_key}' deleted. {size_mb:.0f} MB freed.", 3500)
+            else:
+                QMessageBox.warning(self, "Error", f"Could not delete model '{model_key}'.")
 
     # Sidebar Filter Handling
     def _on_sidebar_item_clicked(self, key: str) -> None:
+        # Switch stack back to Notes Workspace
+        self.main_stack.setCurrentIndex(0)
+        self.settings_panel.setVisible(False)
+        self.toggle_settings_btn.setChecked(False)
+
         for k, item in self.sidebar_items.items():
             item.set_active(k == key)
 
@@ -840,7 +1391,7 @@ class LibraryWindow(QMainWindow):
         elif key == "screenshot":
             self._active_filter_category = None
             self._active_filter_screenshot = True
-            self.filter_indicator_label.setText("Showing: Screenshots")
+            self.filter_indicator_label.setText("Filtered: Screenshots")
             self.filter_indicator_frame.setVisible(True)
         else:
             self._active_filter_category = key
@@ -937,7 +1488,7 @@ class LibraryWindow(QMainWindow):
         else:
             self.screenshot_frame.setVisible(False)
 
-        # Update Tab 1 (Transcript)
+        # Update Transcript
         self.transcript_edit.blockSignals(True)
         self.transcript_edit.setPlainText(note.transcript)
         self.transcript_edit.blockSignals(False)
@@ -950,19 +1501,6 @@ class LibraryWindow(QMainWindow):
         else:
             self.edited_badge.setVisible(False)
             self.original_box.setVisible(False)
-
-        # Update Tab 2 (Processed Text)
-        self.processed_edit.blockSignals(True)
-        self.processed_edit.setPlainText(note.text_processed or "")
-        self.processed_edit.blockSignals(False)
-        self.processed_by_label.setText(f"Method: {note.processed_by or 'None'}")
-        self.copy_processed_btn.setEnabled(bool(note.text_processed))
-
-        # Auto-switch tab based on default version preference
-        if self.settings.default_text_version == "processed" and note.is_processed:
-            self.text_tabs.setCurrentIndex(1)
-        else:
-            self.text_tabs.setCurrentIndex(0)
 
         self.save_btn.setEnabled(False)
         self.copy_main_btn.setEnabled(True)
@@ -985,10 +1523,6 @@ class LibraryWindow(QMainWindow):
         self.transcript_edit.setPlainText("")
         self.transcript_edit.blockSignals(False)
 
-        self.processed_edit.blockSignals(True)
-        self.processed_edit.setPlainText("")
-        self.processed_edit.blockSignals(False)
-
         self.edited_badge.setVisible(False)
         self.original_box.setVisible(False)
         self.save_btn.setEnabled(False)
@@ -1006,7 +1540,7 @@ class LibraryWindow(QMainWindow):
             self.meta_category_label.setText(f"Category: {new_cat or '(None)'}")
             self.note_updated.emit(updated.id, updated.transcript)
             self.refresh_notes()
-            self.status_bar.showMessage(f"Category updated to '{new_cat or 'Uncategorized'}'.", 3000)
+            self.status_bar.showMessage(f"Category updated to '{new_cat or 'None'}'.", 3000)
 
     def _on_text_modified(self) -> None:
         if not self.selected_note:
@@ -1014,81 +1548,84 @@ class LibraryWindow(QMainWindow):
         modified = self.transcript_edit.toPlainText().strip() != self.selected_note.transcript.strip()
         self.save_btn.setEnabled(modified)
 
-    def _on_processed_text_modified(self) -> None:
-        if not self.selected_note:
-            return
-        orig_proc = (self.selected_note.text_processed or "").strip()
-        modified = self.processed_edit.toPlainText().strip() != orig_proc
-        self.save_btn.setEnabled(modified)
-
     def _save_changes(self) -> None:
         if not self.selected_note:
             return
         new_text = self.transcript_edit.toPlainText().strip()
-        new_proc = self.processed_edit.toPlainText().strip()
-
         updated = self.repository.update_transcript(self.selected_note.id, new_text)
-        if new_proc:
-            updated = self.repository.update_processed_text(self.selected_note.id, new_proc, self.selected_note.processed_by or "manual")
-
         if updated:
             self.selected_note = updated
             self.note_updated.emit(updated.id, new_text)
             self.refresh_notes()
             self.status_bar.showMessage("Changes saved successfully.", 3000)
 
-    def _run_text_refinement(self) -> None:
-        """Run text processing and categorization on current note's transcript."""
+    def _run_text_refinement(self, async_mode: bool = True) -> None:
+        """Run AI categorization and tagging on current note."""
         if not self.selected_note:
             return
-        res = self._text_processor.process(
-            self.selected_note.transcript,
-            context_app=self.selected_note.application,
-            context_window=self.selected_note.window_title,
-            language=self.settings.whisper_language,
+
+        target_note = self.selected_note
+
+        if not async_mode:
+            try:
+                res = self._text_processor.process(
+                    target_note.transcript,
+                    context_app=target_note.application,
+                    context_window=target_note.window_title,
+                    language=self.settings.whisper_language,
+                )
+                self._on_refinement_finished(target_note.id, res)
+            except Exception as e:
+                logger.error("Error during categorization: %s", e)
+                self._on_refinement_finished(target_note.id, None)
+            return
+
+        def worker():
+            try:
+                res = self._text_processor.process(
+                    target_note.transcript,
+                    context_app=target_note.application,
+                    context_window=target_note.window_title,
+                    language=self.settings.whisper_language,
+                )
+                self.refinement_finished.emit(target_note.id, res)
+            except Exception as e:
+                logger.error("Error during categorization: %s", e)
+                self.refinement_finished.emit(target_note.id, None)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_refinement_finished(self, note_id: str, res) -> None:
+        if not res or not res.success:
+            return
+
+        updated = self.repository.update_processed_text(
+            note_id,
+            res.text or "",
+            res.processor_id,
+            category=res.category,
+            tags=res.tags,
         )
-        if res.success and (res.text or res.category):
-            updated = self.repository.update_processed_text(
-                self.selected_note.id,
-                res.text or self.selected_note.transcript,
-                res.processor_id,
-                category=res.category,
-                tags=res.tags,
-            )
-            if updated:
-                self.selected_note = updated
-                self.processed_edit.setPlainText(res.text or self.selected_note.transcript)
-                self.processed_by_label.setText(f"Method: {res.processor_id}")
-                self.copy_processed_btn.setEnabled(True)
+        if updated and self.selected_note and self.selected_note.id == note_id:
+            self.selected_note = updated
+            self.category_combo.blockSignals(True)
+            idx = self.category_combo.findData(updated.category or "")
+            if idx >= 0:
+                self.category_combo.setCurrentIndex(idx)
+            self.category_combo.blockSignals(False)
 
-                self.category_combo.blockSignals(True)
-                idx = self.category_combo.findData(updated.category or "")
-                if idx >= 0:
-                    self.category_combo.setCurrentIndex(idx)
-                self.category_combo.blockSignals(False)
-
-                self.meta_category_label.setText(f"Category: {updated.category or '(None)'}")
-                self.meta_tags_label.setText(f"Tags: {', '.join('#' + t for t in updated.tags)}" if updated.tags else "Tags: None")
-                self.refresh_notes()
-                self.status_bar.showMessage("Text refined & categorized successfully.", 3000)
+            self.meta_category_label.setText(f"Category: {updated.category or '(None)'}")
+            self.meta_tags_label.setText(f"Tags: {', '.join('#' + t for t in updated.tags)}" if updated.tags else "Tags: None")
+            self.refresh_notes()
 
     def _copy_original_transcript(self) -> None:
         text = self.transcript_edit.toPlainText().strip()
         if text:
             QApplication.clipboard().setText(text)
-            self.status_bar.showMessage("Original transcript copied to clipboard.", 3000)
-
-    def _copy_processed_text(self) -> None:
-        text = self.processed_edit.toPlainText().strip()
-        if text:
-            QApplication.clipboard().setText(text)
-            self.status_bar.showMessage("Processed text copied to clipboard.", 3000)
+            self.status_bar.showMessage("Transcript copied to clipboard.", 3000)
 
     def _copy_current_active_text(self) -> None:
-        if self.text_tabs.currentIndex() == 1 and self.processed_edit.toPlainText().strip():
-            self._copy_processed_text()
-        else:
-            self._copy_original_transcript()
+        self._copy_original_transcript()
 
     def _open_screenshot_file(self) -> None:
         if self.selected_note and self.selected_note.has_screenshot:
@@ -1100,7 +1637,7 @@ class LibraryWindow(QMainWindow):
         confirm = QMessageBox.question(
             self,
             "Remove Screenshot",
-            "Remove and delete this screenshot?",
+            "Are you sure you want to remove and delete this screenshot?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1116,7 +1653,7 @@ class LibraryWindow(QMainWindow):
             return
         confirm = QMessageBox.question(
             self,
-            "Delete Note",
+            "Delete Thought",
             "Are you sure you want to permanently delete this thought?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1127,7 +1664,7 @@ class LibraryWindow(QMainWindow):
             if success:
                 self.note_deleted.emit(note_id)
                 self.refresh_notes()
-                self.status_bar.showMessage("Note deleted.", 3000)
+                self.status_bar.showMessage("Thought deleted.", 3000)
 
     def _update_status_bar(self, filtered_count: int | None = None) -> None:
         total = self.repository.count()
@@ -1136,14 +1673,28 @@ class LibraryWindow(QMainWindow):
         else:
             self.status_bar.showMessage(f"{total} thoughts saved")
 
-    # Settings callbacks
+    # Settings callbacks and helpers
     def _on_toggle_settings_bar(self, checked: bool) -> None:
-        self.settings_panel.setVisible(checked)
-        self.toggle_settings_btn.setChecked(checked)
+        if checked:
+            self.main_stack.setCurrentIndex(1)
+            self.settings_panel.setVisible(True)
+            self.toggle_settings_btn.setChecked(True)
+            for item in self.sidebar_items.values():
+                item.set_active(False)
+            self._refresh_model_combo_items()
+            self._refresh_whisper_models_card()
+            self._refresh_llm_combo_items()
+            self._refresh_llm_models_card()
+        else:
+            self.main_stack.setCurrentIndex(0)
+            self.settings_panel.setVisible(False)
+            self.toggle_settings_btn.setChecked(False)
+            active_key = self._active_filter_category or ("screenshot" if self._active_filter_screenshot else "all")
+            if active_key in self.sidebar_items:
+                self.sidebar_items[active_key].set_active(True)
 
     def open_settings(self) -> None:
-        self.toggle_settings_btn.setChecked(True)
-        self.settings_panel.setVisible(True)
+        self._on_toggle_settings_bar(True)
 
     def _on_auto_copy_toggled(self, checked: bool) -> None:
         self.settings.auto_copy_clipboard = checked
@@ -1160,7 +1711,7 @@ class LibraryWindow(QMainWindow):
         self.settings.show_notifications = checked
         self.settings.save()
         self.notifications_enabled_toggled.emit(checked)
-        self.status_bar.showMessage("Windows notifications enabled." if checked else "Windows notifications disabled.", 2500)
+        self.status_bar.showMessage("Notifications enabled." if checked else "Notifications disabled.", 2500)
 
     def update_overlay_checkbox(self, visible: bool) -> None:
         self.overlay_cb.blockSignals(True)
@@ -1172,37 +1723,127 @@ class LibraryWindow(QMainWindow):
         self.notifications_cb.setChecked(enabled)
         self.notifications_cb.blockSignals(False)
 
-    def _on_version_combo_changed(self, idx: int) -> None:
-        val = self.version_combo.currentData()
-        self.settings.default_text_version = val
+    def _on_streaming_cb_toggled(self, checked: bool) -> None:
+        self.settings.streaming_transcription = checked
         self.settings.save()
-        self.refresh_notes()
-        self.status_bar.showMessage(f"Default text version: {self.version_combo.currentText()}.", 2500)
+        self.streaming_transcription_toggled.emit(checked)
+        msg = "Live-streaming transcription enabled." if checked else "Batch transcription enabled."
+        self.status_bar.showMessage(msg, 2500)
+
+    def update_streaming_checkbox(self, enabled: bool) -> None:
+        self.streaming_cb.blockSignals(True)
+        self.streaming_cb.setChecked(enabled)
+        self.streaming_cb.blockSignals(False)
+
+    def _refresh_model_combo_items(self) -> None:
+        current_val = self.settings.whisper_model or "small"
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        models = [
+            ("small", "small", "Recommended: ~0.8s, best balance on CPU (460 MB)"),
+            ("base", "base", "Ultra fast: ~0.3s (74 MB)"),
+            ("medium", "medium", "High precision: ~4-6s on CPU (1.5 GB)"),
+            ("large-v3-turbo", "large-v3-turbo", "Maximum accuracy: ~15-20s on CPU (1.6 GB)"),
+        ]
+        for val, name, detail in models:
+            is_cached = is_whisper_model_cached(val)
+            badge = "✓ Installed" if is_cached else "⬇ Download required"
+            label = f"{name}  [{badge}]  —  {detail}"
+            self.model_combo.addItem(label, val)
+
+        idx = self.model_combo.findData(current_val)
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        self.model_combo.blockSignals(False)
+
+    def _refresh_llm_combo_items(self) -> None:
+        current_val = self.settings.llm_model or "qwen2.5-0.5b"
+        self.llm_model_combo.blockSignals(True)
+        self.llm_model_combo.clear()
+        models = [
+            ("qwen2.5-0.5b", "Qwen 2.5 0.5B", "Instant classification (~0.3s, ~390 MB)"),
+            ("qwen2.5-1.5b", "Qwen 2.5 1.5B", "High precision (~1s, ~980 MB)"),
+        ]
+        for val, name, detail in models:
+            is_cached = is_llm_model_cached(val)
+            badge = "✓ Installed" if is_cached else "⬇ Download required"
+            label = f"{name}  [{badge}]  —  {detail}"
+            self.llm_model_combo.addItem(label, val)
+
+        idx = self.llm_model_combo.findData(current_val)
+        if idx >= 0:
+            self.llm_model_combo.setCurrentIndex(idx)
+        self.llm_model_combo.blockSignals(False)
+
+    def show_model_loading(self, model_name: str) -> None:
+        """Display animated loading progress bar and status when switching/loading model."""
+        is_cached = is_whisper_model_cached(model_name)
+        text = (
+            f"Loading model '{model_name}'..."
+            if is_cached
+            else f"Downloading and preparing model '{model_name}' (may take a moment)..."
+        )
+        self.model_status_frame.setStyleSheet(
+            "QFrame#statusFrame { background: #f4f4f5; border: 1px solid #e4e4e7; border-radius: 8px; padding: 8px 14px; }"
+        )
+        self.model_status_icon.setPixmap(get_vector_pixmap("sparkles", color="#18181b", size=15))
+        self.model_status_label.setText(text)
+        self.model_status_label.setStyleSheet("color: #18181b; font-size: 12px; font-weight: 600;")
+        self.model_progress.setVisible(True)
+        self.model_status_frame.setVisible(True)
+        self.model_combo.setEnabled(False)
+
+    def hide_model_loading(self, model_name: str, success: bool = True, error_message: str | None = None) -> None:
+        """Update UI when model loading completes or fails."""
+        self.model_progress.setVisible(False)
+        self.model_combo.setEnabled(True)
+        if success:
+            self.model_status_frame.setStyleSheet(
+                "QFrame#statusFrame { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 8px 14px; }"
+            )
+            self.model_status_icon.setPixmap(get_vector_pixmap("check-circle", color="#16a34a", size=15))
+            self.model_status_label.setText(f"Model '{model_name}' active and ready.")
+            self.model_status_label.setStyleSheet("color: #15803d; font-size: 12px; font-weight: 600;")
+            self._refresh_model_combo_items()
+            self._refresh_whisper_models_card()
+        else:
+            self.model_status_frame.setStyleSheet(
+                "QFrame#statusFrame { background: #fef2f2; border: 1px solid #fecdd3; border-radius: 8px; padding: 8px 14px; }"
+            )
+            self.model_status_icon.setPixmap(get_vector_pixmap("alert-circle", color="#dc2626", size=15))
+            err_text = f"Error loading model '{model_name}': {error_message}" if error_message else f"Error loading model '{model_name}'"
+            self.model_status_label.setText(err_text)
+            self.model_status_label.setStyleSheet("color: #b91c1c; font-size: 12px; font-weight: 600;")
 
     def _on_model_combo_changed(self, idx: int) -> None:
         model = self.model_combo.currentData()
+        if not model:
+            return
+        self.show_model_loading(model)
         self.settings.whisper_model = model
         self.settings.save()
         self.whisper_model_changed.emit(model)
-        self.status_bar.showMessage(f"Whisper Model: '{model}'. Preloading...", 3000)
+        self._refresh_whisper_models_card()
+        self.status_bar.showMessage(f"Preparing Whisper model '{model}'...", 3000)
 
     def _on_lang_combo_changed(self, idx: int) -> None:
         lang = self.lang_combo.currentData()
         self.settings.whisper_language = lang
         self.settings.save()
         self.whisper_language_changed.emit(lang)
-        self.status_bar.showMessage(f"Language: '{self.lang_combo.currentText()}'.", 2500)
+        self.status_bar.showMessage(f"Spoken language: '{self.lang_combo.currentText()}'.", 2500)
 
     def _on_engine_combo_changed(self, idx: int) -> None:
         engine = self.engine_combo.currentData()
         self.settings.refinement_engine = engine
         self.settings.save()
         self.refinement_engine_changed.emit(engine)
-        self.status_bar.showMessage(f"Engine: '{self.engine_combo.currentText()}'.", 2500)
+        self.status_bar.showMessage(f"Method: '{self.engine_combo.currentText()}'.", 2500)
 
     def _on_llm_model_combo_changed(self, idx: int) -> None:
         model = self.llm_model_combo.currentData()
         self.settings.llm_model = model
         self.settings.save()
         self.llm_model_changed.emit(model)
-        self.status_bar.showMessage(f"LLM Model: '{model}'.", 2500)
+        self._refresh_llm_models_card()
+        self.status_bar.showMessage(f"LLM model: '{model}'.", 2500)

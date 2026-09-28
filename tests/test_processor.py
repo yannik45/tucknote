@@ -84,3 +84,29 @@ def test_local_llm_processor_model_switch():
     assert proc.model_key == "qwen2.5-0.5b"
     proc.update_model("qwen2.5-1.5b")
     assert proc.model_key == "qwen2.5-1.5b"
+
+
+def test_llm_model_size_and_deletion(tmp_path, monkeypatch):
+    from tucknote.transcription import llm_processor
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(llm_processor, "get_data_dir", lambda: tmp_path)
+
+    # Initially not cached
+    assert llm_processor.is_llm_model_cached("qwen2.5-0.5b") is False
+    assert llm_processor.get_llm_model_size_mb("qwen2.5-0.5b") == 0.0
+
+    # Create dummy model file
+    model_path = llm_processor.get_llm_model_path("qwen2.5-0.5b")
+    model_path.write_bytes(b"\x00" * (1024 * 1024 * 3))  # 3 MB
+
+    assert llm_processor.is_llm_model_cached("qwen2.5-0.5b") is True
+    assert llm_processor.get_llm_model_size_mb("qwen2.5-0.5b") >= 2.9
+
+    # Delete
+    deleted = llm_processor.delete_llm_model("qwen2.5-0.5b")
+    assert deleted is True
+    assert llm_processor.is_llm_model_cached("qwen2.5-0.5b") is False
+    assert model_path.exists() is False
+

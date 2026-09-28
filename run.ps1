@@ -15,7 +15,7 @@ if ($Hotkey) { $cmdArgs += "--hotkey", $Hotkey }
 # 1. Use project virtual environment if present
 $VenvTucknote = Join-Path $ScriptDir ".venv\Scripts\tucknote.exe"
 if (Test-Path $VenvTucknote) {
-    & $VenvTucknote @cmdArgs
+    & $VenvTucknote @cmdArgs/
     exit $LASTEXITCODE
 }
 

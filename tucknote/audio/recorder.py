@@ -71,6 +71,8 @@ class AudioRecorder:
         self._lock = threading.Lock()
         self._stream = None
         self._frames: list[np.ndarray] = []
+        self._streaming_read_idx = 0
+        self._last_raw_audio: np.ndarray | None = None
         self._is_recording = False
         self._start_time: float = 0.0
         self._max_timer: threading.Timer | None = None
@@ -112,6 +114,7 @@ class AudioRecorder:
                 raise AudioError(f"Audio device query failed: {e}") from e
 
             self._frames = []
+            self._streaming_read_idx = 0
             self._start_time = time.time()
 
             try:
@@ -181,6 +184,7 @@ class AudioRecorder:
 
             frames_copy = self._frames
             self._frames = []
+            self._streaming_read_idx = 0
 
         if not frames_copy:
             logger.info("No audio frames recorded (duration was 0).")
@@ -188,6 +192,7 @@ class AudioRecorder:
 
         raw_data = np.concatenate(frames_copy, axis=0)
         raw_data = normalize_audio_frames(raw_data)
+        self._last_raw_audio = raw_data
         num_samples = len(raw_data)
         duration_seconds = num_samples / self.sample_rate
 
@@ -231,4 +236,24 @@ class AudioRecorder:
                 self._stream = None
 
             self._frames = []
+            self._streaming_read_idx = 0
         logger.info("Audio recording canceled and discarded.")
+
+    def get_unprocessed_frames(self) -> np.ndarray:
+        """Return newly captured audio frames since last call as a 1D int16 array.
+        
+        Thread-safe for streaming workers reading chunks while recording is active.
+        """
+        with self._lock:
+            if not self._frames:
+                return np.array([], dtype=np.int16)
+            new_frames = self._frames[self._streaming_read_idx:]
+            self._streaming_read_idx = len(self._frames)
+            if not new_frames:
+                return np.array([], dtype=np.int16)
+            return np.concatenate(new_frames, axis=0).flatten()
+
+    @property
+    def last_raw_audio(self) -> np.ndarray | None:
+        """Return raw 1D int16 audio samples of the most recently stopped recording."""
+        return self._last_raw_audio

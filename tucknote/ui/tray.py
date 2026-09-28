@@ -58,7 +58,7 @@ class ThoughtCaptureTray(QSystemTrayIcon):
         self.menu.addAction(self.open_lib_action)
 
         # Settings
-        self.open_settings_action = QAction("⚙️ Settings...", self.menu)
+        self.open_settings_action = QAction("Settings...", self.menu)
         self.open_settings_action.triggered.connect(self.signals.open_settings_requested.emit)
         self.menu.addAction(self.open_settings_action)
 
@@ -105,7 +105,7 @@ class ThoughtCaptureTray(QSystemTrayIcon):
         self.setIcon(create_status_icon(state))
 
         if state == "recording":
-            self.setToolTip(f"Thought Capture — Recording... ({self.hotkey_str} to finish)")
+            self.setToolTip(f"Tucknote — Recording... ({self.hotkey_str} to finish)")
             self.status_action.setText("Status: Recording...")
             self.toggle_rec_action.setText(f"Finish Recording ({self.hotkey_str})")
             self.toggle_rec_action.setEnabled(True)
@@ -114,7 +114,7 @@ class ThoughtCaptureTray(QSystemTrayIcon):
             self.discard_action.setVisible(False)
 
         elif state == "processing":
-            self.setToolTip("Thought Capture — Processing recording...")
+            self.setToolTip("Tucknote — Processing recording...")
             self.status_action.setText("Status: Processing...")
             self.toggle_rec_action.setText("Processing...")
             self.toggle_rec_action.setEnabled(False)
@@ -124,7 +124,7 @@ class ThoughtCaptureTray(QSystemTrayIcon):
 
         elif state == "error":
             err_text = detail_message or "Error occurred"
-            self.setToolTip(f"Thought Capture — Error: {err_text}")
+            self.setToolTip(f"Tucknote — Error: {err_text}")
             self.status_action.setText(f"Status: Error ({err_text})")
             self.toggle_rec_action.setText(f"New Recording ({self.hotkey_str})")
             self.toggle_rec_action.setEnabled(True)
@@ -133,7 +133,7 @@ class ThoughtCaptureTray(QSystemTrayIcon):
             self.discard_action.setVisible(True)
 
         else:  # ready
-            self.setToolTip(f"Thought Capture — Ready ({self.hotkey_str})")
+            self.setToolTip(f"Tucknote — Ready ({self.hotkey_str})")
             self.status_action.setText(f"Status: Ready ({self.hotkey_str})")
             self.toggle_rec_action.setText(f"Start Recording ({self.hotkey_str})")
             self.toggle_rec_action.setEnabled(True)
