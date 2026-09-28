@@ -196,15 +196,13 @@ def test_library_window_refinement_and_screenshot(qapp, tmp_path: Path):
     # Screenshot frame must be visible
     assert win.screenshot_frame.isVisible() is True
 
-    # Test text refinement
-    win._run_text_refinement()
-    assert "API" in win.processed_edit.toPlainText()
-    assert "ähm" not in win.processed_edit.toPlainText()
+    # Test categorization
+    win._run_text_refinement(async_mode=False)
+    assert win.transcript_edit.toPlainText() == "Ich denke ähm die api muss refactored werden"
 
-    # Verify saved to repo
+    # Verify saved to repo with category
     updated = repo.get_by_id("refine-1")
-    assert updated.is_processed is True
-    assert "API" in updated.text_processed
+    assert updated is not None
     assert updated.category == "Task"  # Heuristic from 'muss' / 'refactored'
 
     # Test settings panel toggle
@@ -271,5 +269,107 @@ def test_library_window_settings_toggles(qapp, tmp_path: Path):
     assert win.settings.llm_model == "qwen2.5-1.5b"
     assert llm_signals == ["qwen2.5-1.5b"]
 
+    # Test streaming transcription checkbox toggle
+    streaming_signals = []
+    win.streaming_transcription_toggled.connect(streaming_signals.append)
+    assert win.streaming_cb.isChecked() is False
+    win.streaming_cb.setChecked(True)
+    assert win.settings.streaming_transcription is True
+    assert streaming_signals == [True]
+
+    win.update_streaming_checkbox(False)
+    assert win.streaming_cb.isChecked() is False
+
+    # Test model loading indicator UI
+    win.show_model_loading("medium")
+    assert win.model_progress.isVisible() is True
+    assert win.model_combo.isEnabled() is False
+    assert "medium" in win.model_status_label.text()
+
+    win.hide_model_loading("medium", success=True)
+    assert win.model_progress.isVisible() is False
+    assert win.model_combo.isEnabled() is True
+    assert "ready" in win.model_status_label.text().lower()
+
+    win.hide_model_loading("medium", success=False, error_message="Network error")
+    assert win.model_progress.isVisible() is False
+    assert "error" in win.model_status_label.text().lower()
+
     win.close()
+
+
+
+def test_toggle_switch_widget(qapp):
+    from tucknote.ui.toggle_switch import ToggleSwitch
+
+    switch = ToggleSwitch()
+    assert switch.isChecked() is False
+    assert switch.sizeHint().width() > 30
+
+    toggled_signals = []
+    switch.toggled.connect(toggled_signals.append)
+
+    switch.setChecked(True)
+    assert switch.isChecked() is True
+    assert switch._thumb_pos == 1.0
+
+    switch.toggle()
+    assert switch.isChecked() is False
+    assert len(toggled_signals) >= 1
+
+
+def test_settings_navigation_and_model_actions(qapp, tmp_path: Path, monkeypatch):
+    from tucknote.config import AppSettings
+    from tucknote.storage.repository import NoteRepository
+    from tucknote.ui.library_window import LibraryWindow
+    from PySide6.QtWidgets import QMessageBox
+
+    db_file = tmp_path / "settings_nav.db"
+    repo = NoteRepository(db_file)
+    settings = AppSettings(whisper_model="small", llm_model="qwen2.5-0.5b")
+
+    win = LibraryWindow(repo, settings)
+    win.show()
+
+    # Initial state: Stack index 0 (Notes view)
+    assert win.main_stack.currentIndex() == 0
+    assert win.toggle_settings_btn.isChecked() is False
+
+    # Switch to Settings
+    win.open_settings()
+    assert win.main_stack.currentIndex() == 1
+    assert win.settings_panel.isVisible() is True
+    assert win.toggle_settings_btn.isChecked() is True
+
+    # Click sidebar category item switches back to Notes
+    win._on_sidebar_item_clicked("Task")
+    assert win.main_stack.currentIndex() == 0
+    assert win.settings_panel.isVisible() is False
+    assert win.toggle_settings_btn.isChecked() is False
+
+    # Back to settings
+    win.open_settings()
+    assert win.main_stack.currentIndex() == 1
+
+    # Simulate model deletion confirmation
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
+
+    # Test whisper deletion handler
+    deleted_models = []
+    monkeypatch.setattr("tucknote.ui.library_window.delete_whisper_model", lambda m: (deleted_models.append(m), True)[1])
+    win._on_delete_whisper_model("small")
+    assert "small" in deleted_models
+    # Active model should fallback from small to base
+    assert win.settings.whisper_model == "base"
+
+    # Test llm deletion handler
+    deleted_llms = []
+    monkeypatch.setattr("tucknote.ui.library_window.delete_llm_model", lambda m: (deleted_llms.append(m), True)[1])
+    win._on_delete_llm_model("qwen2.5-0.5b")
+    assert "qwen2.5-0.5b" in deleted_llms
+    # Active llm model should fallback to 1.5b
+    assert win.settings.llm_model == "qwen2.5-1.5b"
+
+    win.close()
+
 

@@ -72,3 +72,31 @@ def test_normalize_audio_frames():
     norm_silent = normalize_audio_frames(silent)
     assert np.array_equal(silent, norm_silent)
 
+
+def test_recorder_streaming_unprocessed_frames():
+    rec = AudioRecorder(sample_rate=16000)
+    rec._is_recording = True
+
+    # Initially empty
+    assert len(rec.get_unprocessed_frames()) == 0
+
+    # Add frame 1
+    f1 = np.ones((1600, 1), dtype=np.int16) * 100
+    rec._frames.append(f1)
+    unprocessed = rec.get_unprocessed_frames()
+    assert len(unprocessed) == 1600
+    assert np.all(unprocessed == 100)
+
+    # Calling again without new frames returns empty
+    assert len(rec.get_unprocessed_frames()) == 0
+
+    # Add frame 2 and frame 3
+    f2 = np.ones((800, 1), dtype=np.int16) * 200
+    f3 = np.ones((800, 1), dtype=np.int16) * 300
+    rec._frames.extend([f2, f3])
+    unprocessed2 = rec.get_unprocessed_frames()
+    assert len(unprocessed2) == 1600
+    assert np.all(unprocessed2[:800] == 200)
+    assert np.all(unprocessed2[800:] == 300)
+
+

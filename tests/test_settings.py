@@ -15,6 +15,7 @@ def test_settings_defaults():
     assert s.whisper_language == "de"
     assert s.refinement_engine == "llm"
     assert s.llm_model == "qwen2.5-0.5b"
+    assert s.streaming_transcription is False
 
 
 def test_settings_save_and_load(tmp_path: Path, monkeypatch):
@@ -30,6 +31,7 @@ def test_settings_save_and_load(tmp_path: Path, monkeypatch):
         whisper_language="en",
         refinement_engine="rules",
         llm_model="qwen2.5-1.5b",
+        streaming_transcription=True,
         overlay_x=250,
         overlay_y=120,
     )
@@ -45,5 +47,6 @@ def test_settings_save_and_load(tmp_path: Path, monkeypatch):
     assert loaded.whisper_language == "en"
     assert loaded.refinement_engine == "rules"
     assert loaded.llm_model == "qwen2.5-1.5b"
+    assert loaded.streaming_transcription is True
     assert loaded.overlay_x == 250
     assert loaded.overlay_y == 120

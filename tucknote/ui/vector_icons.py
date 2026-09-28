@@ -125,12 +125,28 @@ SVG_PATHS: Final[dict[str, str]] = {
     "chevron-right": (
         '<polyline points="9 18 15 12 9 6"/>'
     ),
+    "chevron-down": (
+        '<polyline points="6 9 12 15 18 9"/>'
+    ),
     "filter": (
         '<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>'
     ),
 }
 
 _PIXMAP_CACHE: dict[tuple[str, str, int, float], QPixmap] = {}
+
+
+def get_chevron_icon_path() -> str:
+    """Ensure a clean chevron-down PNG icon is saved on disk for QSS use and return its file URI."""
+    from tucknote.config import get_data_dir
+    assets_dir = get_data_dir() / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    icon_path = assets_dir / "chevron-down.png"
+    if not icon_path.exists():
+        pix = get_vector_pixmap("chevron-down", color="#71717a", size=16, stroke_width=2.2)
+        pix.save(str(icon_path), "PNG")
+    return icon_path.as_posix()
+
 
 
 def get_vector_pixmap(name: str, color: str = "#64748b", size: int = 16, stroke_width: float = 2.0) -> QPixmap:
@@ -161,40 +177,40 @@ def get_vector_pixmap(name: str, color: str = "#64748b", size: int = 16, stroke_
     return pix
 
 
-def get_vector_icon(name: str, color: str = "#64748b", size: int = 16, stroke_width: float = 2.0) -> QIcon:
+def get_vector_icon(name: str, color: str = "#52525b", size: int = 16, stroke_width: float = 1.6) -> QIcon:
     """Return a QIcon wrapping the rendered vector pixmap."""
     pix = get_vector_pixmap(name, color=color, size=size, stroke_width=stroke_width)
     return QIcon(pix)
 
 
-# Category color and icon helpers
+# Category color and icon helpers — Minimalist Apple / ChatGPT monochromatic palette
 CATEGORY_THEMES: Final[dict[str, dict[str, str]]] = {
     "Task": {
         "label": "Task",
         "icon": "check-square",
-        "color": "#2563eb",
-        "bg": "#eff6ff",
-        "border": "#bfdbfe",
+        "color": "#18181b",
+        "bg": "#f4f4f5",
+        "border": "#e4e4e7",
     },
     "Bug": {
         "label": "Bug",
         "icon": "bug",
-        "color": "#e11d48",
-        "bg": "#fff1f2",
-        "border": "#fecdd3",
+        "color": "#3f3f46",
+        "bg": "#f4f4f5",
+        "border": "#e4e4e7",
     },
     "Idea": {
         "label": "Idea",
         "icon": "lightbulb",
-        "color": "#d97706",
-        "bg": "#fffbeb",
-        "border": "#fde68a",
+        "color": "#52525b",
+        "bg": "#f4f4f5",
+        "border": "#e4e4e7",
     },
     "Note": {
         "label": "Note",
         "icon": "file-text",
-        "color": "#475569",
-        "bg": "#f8fafc",
-        "border": "#e2e8f0",
+        "color": "#71717a",
+        "bg": "#f4f4f5",
+        "border": "#e4e4e7",
     },
 }

@@ -10,7 +10,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 
 APP_NAME = "tucknote"
-APP_DISPLAY_NAME = "Thought Capture"
+APP_DISPLAY_NAME = "Tucknote"
 APP_VERSION = "0.2.0"
 
 # Directories
@@ -70,6 +70,7 @@ class AppSettings:
     hotkey_str: str = "Ctrl+Alt+Space"
     refinement_engine: str = "llm"  # "llm" or "rules"
     llm_model: str = "qwen2.5-0.5b"  # "qwen2.5-0.5b" or "qwen2.5-1.5b"
+    streaming_transcription: bool = False  # Transcribe speech chunks in background while recording
 
     @classmethod
     def load(cls) -> AppSettings:
@@ -94,6 +95,7 @@ class AppSettings:
                 hotkey_str=str(data.get("hotkey_str", "Ctrl+Alt+Space")),
                 refinement_engine=str(data.get("refinement_engine", "llm")),
                 llm_model=str(data.get("llm_model", "qwen2.5-0.5b")),
+                streaming_transcription=bool(data.get("streaming_transcription", False)),
             )
         except Exception as e:
             logger = logging.getLogger(APP_NAME)
